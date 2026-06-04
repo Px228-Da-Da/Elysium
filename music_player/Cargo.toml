@@ -1,6 +1,6 @@
 [package]
-name = "music_player"
-version = "0.1.0"
+name = "Elysium"
+version = "1.0.2"
 edition = "2021"
 
 [dependencies]
@@ -11,3 +11,8 @@ walkdir = "2"
 mp3-duration = "0.1.10"
 id3 = "1.17.0"
 image = "0.25.10"
+rdev = { version = "0.5", features = ["unstable_grab"] }
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+serde = { version = "1", features = ["derive"] }
+self_update = "0.42"
+tokio = { version = "1", features = ["full"] }

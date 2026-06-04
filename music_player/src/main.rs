@@ -7,9 +7,19 @@ use scanner::{scan_music, Playlist};
 use eframe::egui;
 use egui::{vec2, Color32, FontId, RichText, Rounding, Stroke, Vec2, Rect, pos2};
 use std::time::{Duration, Instant};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{channel, Receiver};
+use std::sync::{Arc, Mutex};
 use std::thread;
+
+#[derive(Default, Clone)]
+struct UpdateState {
+    available: bool,
+    latest_version: String,
+    checking: bool,
+    updating: bool,         // Идёт ли скачивание прямо сейчас
+    error: Option<String>,  // Текст ошибки, если что-то пошло не так
+}
 
 // Файл, в котором хранится список лайкнутых треков (по одному пути на строку).
 // Лежит в рабочей папке — там же, откуда приложение ищет "../DownloadedMusic".
@@ -28,6 +38,43 @@ fn load_liked_songs() -> Vec<String> {
         .unwrap_or_default()
 }
 
+// Файл с составами обычных плейлистов (рядом с liked_songs.txt).
+// Формат: на каждой строке  «имя_плейлиста<TAB>путь_к_треку».
+const PLAYLISTS_FILE: &str = "playlists.txt";
+
+// Читает сохранённые плейлисты: список (имя, пути_к_трекам) в порядке появления.
+fn load_saved_playlists() -> Vec<(String, Vec<String>)> {
+    let mut order: Vec<String> = Vec::new();
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+
+    if let Ok(content) = std::fs::read_to_string(PLAYLISTS_FILE) {
+        for line in content.lines() {
+            if let Some((name, path)) = line.split_once('\t') {
+                let name = name.trim();
+                let path = path.trim();
+                if name.is_empty() {
+                    continue;
+                }
+                if !map.contains_key(name) {
+                    order.push(name.to_string());
+                }
+                let entry = map.entry(name.to_string()).or_default();
+                if !path.is_empty() {
+                    entry.push(path.to_string());
+                }
+            }
+        }
+    }
+
+    order
+        .into_iter()
+        .map(|name| {
+            let songs = map.remove(&name).unwrap_or_default();
+            (name, songs)
+        })
+        .collect()
+}
+
 // ============================================================
 // Вспомогательные функции
 // ============================================================
@@ -37,6 +84,26 @@ fn format_duration(d: Duration) -> String {
     let mins = total_secs / 60;
     let secs = total_secs % 60;
     format!("{}:{:02}", mins, secs)
+}
+
+// Единый «плоский» стиль для пунктов меню (и выпадающего, и по правому клику):
+// без рамки, прозрачный фон в покое, мягкая серая подсветка при наведении.
+fn style_menu(ui: &mut egui::Ui) {
+    let v = ui.visuals_mut();
+    v.widgets.inactive.bg_stroke = Stroke::NONE;
+    v.widgets.hovered.bg_stroke  = Stroke::NONE;
+    v.widgets.active.bg_stroke   = Stroke::NONE;
+
+    v.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+    v.widgets.inactive.bg_fill      = Color32::TRANSPARENT;
+
+    v.widgets.hovered.weak_bg_fill = Color32::from_rgb(48, 48, 48);
+    v.widgets.hovered.bg_fill      = Color32::from_rgb(48, 48, 48);
+    v.widgets.active.weak_bg_fill  = Color32::from_rgb(60, 60, 60);
+    v.widgets.active.bg_fill       = Color32::from_rgb(60, 60, 60);
+
+    v.widgets.hovered.fg_stroke.color = Color32::WHITE;
+    v.widgets.active.fg_stroke.color  = Color32::WHITE;
 }
 
 // 🎨 Возвращаем ваш оригинальный стиль (Темный фон + Зеленый акцент)
@@ -123,10 +190,382 @@ enum LoaderMsg {
     Meta(String, TrackMeta),
 }
 
+// ============================================================
+// 🌐 Локализация интерфейса (мультиязычность)
+//
+// Чтобы ДОБАВИТЬ новый язык (например английский):
+//   1) добавь вариант в enum Lang        ->  En,
+//   2) добавь его в Lang::all()           ->  кнопка появится в настройках
+//   3) добавь название в native_name()    ->  подпись на кнопке
+//   4) добавь код в code()/from_code()    ->  для сохранения в файл
+//   5) добавь блок перевода в strings()   ->  компилятор не даст забыть поле
+// ============================================================
+
+// Файл, где запоминается выбранный язык (рядом с liked_songs.txt).
+const LANG_FILE: &str = "language.txt";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lang {
+    Ru,
+    Uk,
+}
+
+impl Lang {
+    // Все языки по порядку — в этом же порядке рисуются кнопки выбора.
+    fn all() -> &'static [Lang] {
+        &[Lang::Ru, Lang::Uk]
+    }
+
+    // Название языка на нём самом (подпись кнопки).
+    fn native_name(&self) -> &'static str {
+        match self {
+            Lang::Ru => "Русский",
+            Lang::Uk => "Українська",
+        }
+    }
+
+    // Короткий код для сохранения в файл.
+    fn code(&self) -> &'static str {
+        match self {
+            Lang::Ru => "ru",
+            Lang::Uk => "uk",
+        }
+    }
+
+    // Разбор кода из файла. Неизвестный код -> язык по умолчанию.
+    fn from_code(code: &str) -> Lang {
+        match code.trim() {
+            "uk" => Lang::Uk,
+            _ => Lang::Ru,
+        }
+    }
+}
+
+// Читает сохранённый язык с диска (или язык по умолчанию).
+fn load_language() -> Lang {
+    std::fs::read_to_string(LANG_FILE)
+        .map(|c| Lang::from_code(&c))
+        .unwrap_or(Lang::Ru)
+}
+
+// Сохраняет выбранный язык на диск.
+fn save_language(lang: Lang) {
+    let _ = std::fs::write(LANG_FILE, lang.code());
+}
+
+// Все подписи интерфейса для одного языка.
+// {n} в строке — место для подстановки числа (см. .replace("{n}", ...)).
+struct Strings {
+    search_hint: &'static str,
+    user: &'static str,
+    home: &'static str,
+    new_playlist: &'static str,
+    new_playlist_hint: &'static str,
+    new_playlist_title: &'static str,   // ← добавить
+    create: &'static str,               // ← добавить
+    cancel: &'static str,               // ← добавить
+    liked_music: &'static str,
+    auto_created: &'static str,
+    liked_empty: &'static str,
+    like_hint: &'static str,
+    unlike_hint: &'static str,
+    play: &'static str,
+    sort: &'static str,
+    listen_again: &'static str,
+    playlist_tracks: &'static str,
+    unknown_title: &'static str,
+    unknown_artist: &'static str,
+    settings: &'static str,
+    settings_in_dev: &'static str,
+    settings_in_dev_sub: &'static str,
+    language: &'static str,
+    shortcuts: &'static str,
+    press_key: &'static str,
+    not_set: &'static str,
+}
+
+// Возвращает все строки для выбранного языка.
+// Чтобы добавить язык — добавь сюда ещё одну ветку match (со всеми полями).
+fn strings(lang: Lang) -> Strings {
+    match lang {
+        Lang::Ru => Strings {
+            search_hint: "Поиск треков, артистов...",
+            user: "👤 Профиль",
+            home: "Главная",
+            new_playlist: "➕ Новый",
+            new_playlist_hint: "Название плейлиста",
+            new_playlist_title: "Новый плейлист",
+            create: "Создать",
+            cancel: "Отмена",
+            liked_music: "Понравившаяся музыка",
+            auto_created: "📌 Создан автоматически",
+            liked_empty: "Здесь пока пусто. Треки, которые вы лайкнете, появятся тут.",
+            like_hint: "Сохранить в «Понравившаяся музыка»",
+            unlike_hint: "Убрать из «Понравившаяся музыка»",
+            play: "   ▶  Слушать   ",
+            sort: "Упорядочить",
+            listen_again: "Послушать ещё раз",
+            playlist_tracks: "Плейлист • {n} треков",
+            unknown_title: "Без названия",
+            unknown_artist: "Неизвестный исполнитель",
+            settings: "Настройки",
+            settings_in_dev: "Остальные настройки в разработке",
+            settings_in_dev_sub: "Они появятся в одном из следующих обновлений.",
+            language: "Язык",
+            shortcuts: "Горячие клавиши",
+            press_key: "Нажмите клавишу…",
+            not_set: "не задано",
+        },
+        Lang::Uk => Strings {
+            search_hint: "Пошук треків, виконавців...",
+            user: "👤 Профіль",
+            home: "Головна",
+            new_playlist: "➕ Новий",
+            new_playlist_hint: "Назва плейлиста",
+            new_playlist_title: "Новий плейлист",
+            create: "Створити",
+            cancel: "Скасувати",
+            liked_music: "Вподобана музика",
+            auto_created: "📌 Створено автоматично",
+            liked_empty: "Тут поки що порожньо. Треки, які ви вподобаєте, з'являться тут.",
+            like_hint: "Зберегти у «Вподобана музика»",
+            unlike_hint: "Прибрати з «Вподобана музика»",
+            play: "   ▶  Слухати   ",
+            sort: "Упорядкувати",
+            listen_again: "Послухати ще раз",
+            playlist_tracks: "Плейлист • {n} треків",
+            unknown_title: "Без назви",
+            unknown_artist: "Невідомий виконавець",
+            settings: "Налаштування",
+            settings_in_dev: "Інші налаштування в розробці",
+            settings_in_dev_sub: "Вони з'являться в одному з наступних оновлень.",
+            language: "Мова",
+            shortcuts: "Гарячі клавіші",
+            press_key: "Натисніть клавішу…",
+            not_set: "не призначено",
+        },
+    }
+}
+
+
+// ============================================================
+// ⌨️ Горячие клавиши (настраиваются в окне настроек)
+//
+// Чтобы ДОБАВИТЬ новое действие:
+//   1) добавь вариант в enum Shortcut
+//   2) добавь его в Shortcut::all()           -> появится строкой в настройках
+//   3) добавь код в code()/from_code()        -> для сохранения в файл
+//   4) добавь подпись в label()               -> текст на всех языках
+//   5) добавь обработку в App::do_shortcut()  -> что именно делать
+//   6) (по желанию) клавишу по умолчанию в default_shortcuts()
+// ============================================================
+
+// Файл, где запоминаются назначенные клавиши.
+const SHORTCUTS_FILE: &str = "shortcuts.txt";
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Shortcut {
+    PlayPause,
+    Next,
+    Prev,
+    VolumeUp,
+    VolumeDown,
+    ToggleLike,
+}
+
+impl Shortcut {
+    // Все действия по порядку (в этом порядке рисуются строки в настройках).
+    fn all() -> &'static [Shortcut] {
+        &[
+            Shortcut::PlayPause,
+            Shortcut::Next,
+            Shortcut::Prev,
+            Shortcut::VolumeUp,
+            Shortcut::VolumeDown,
+            Shortcut::ToggleLike,
+        ]
+    }
+
+    // Короткий код для сохранения в файл.
+    fn code(&self) -> &'static str {
+        match self {
+            Shortcut::PlayPause => "play_pause",
+            Shortcut::Next => "next",
+            Shortcut::Prev => "prev",
+            Shortcut::VolumeUp => "vol_up",
+            Shortcut::VolumeDown => "vol_down",
+            Shortcut::ToggleLike => "like",
+        }
+    }
+
+    fn from_code(code: &str) -> Option<Shortcut> {
+        Some(match code {
+            "play_pause" => Shortcut::PlayPause,
+            "next" => Shortcut::Next,
+            "prev" => Shortcut::Prev,
+            "vol_up" => Shortcut::VolumeUp,
+            "vol_down" => Shortcut::VolumeDown,
+            "like" => Shortcut::ToggleLike,
+            _ => return None,
+        })
+    }
+
+    // Подпись действия на выбранном языке.
+    fn label(&self, lang: Lang) -> &'static str {
+        match lang {
+            Lang::Ru => match self {
+                Shortcut::PlayPause => "Воспроизведение / Пауза",
+                Shortcut::Next => "Следующий трек",
+                Shortcut::Prev => "Предыдущий трек",
+                Shortcut::VolumeUp => "Громче",
+                Shortcut::VolumeDown => "Тише",
+                Shortcut::ToggleLike => "Лайк / снять лайк",
+            },
+            Lang::Uk => match self {
+                Shortcut::PlayPause => "Відтворення / Пауза",
+                Shortcut::Next => "Наступний трек",
+                Shortcut::Prev => "Попередній трек",
+                Shortcut::VolumeUp => "Гучніше",
+                Shortcut::VolumeDown => "Тихіше",
+                Shortcut::ToggleLike => "Лайк / зняти лайк",
+            },
+        }
+    }
+}
+
+// Клавиши, которые умеем СОХРАНЯТЬ между запусками.
+// Нажать в настройках можно ЛЮБУЮ клавишу, но чтобы выбор пережил перезапуск,
+// клавиша должна быть в этом списке. Нужна ещё одна — просто допиши строкой
+// (например egui::Key::Backslash для «\»).
+const BINDABLE_KEYS: &[egui::Key] = &[
+    egui::Key::Space, egui::Key::Enter, egui::Key::Tab, egui::Key::Backspace,
+    egui::Key::Delete, egui::Key::Insert, egui::Key::Home, egui::Key::End,
+    egui::Key::PageUp, egui::Key::PageDown,
+    egui::Key::ArrowUp, egui::Key::ArrowDown, egui::Key::ArrowLeft, egui::Key::ArrowRight,
+    egui::Key::Num0, egui::Key::Num1, egui::Key::Num2, egui::Key::Num3, egui::Key::Num4,
+    egui::Key::Num5, egui::Key::Num6, egui::Key::Num7, egui::Key::Num8, egui::Key::Num9,
+    egui::Key::A, egui::Key::B, egui::Key::C, egui::Key::D, egui::Key::E, egui::Key::F,
+    egui::Key::G, egui::Key::H, egui::Key::I, egui::Key::J, egui::Key::K, egui::Key::L,
+    egui::Key::M, egui::Key::N, egui::Key::O, egui::Key::P, egui::Key::Q, egui::Key::R,
+    egui::Key::S, egui::Key::T, egui::Key::U, egui::Key::V, egui::Key::W, egui::Key::X,
+    egui::Key::Y, egui::Key::Z,
+    egui::Key::F1, egui::Key::F2, egui::Key::F3, egui::Key::F4, egui::Key::F5, egui::Key::F6,
+    egui::Key::F7, egui::Key::F8, egui::Key::F9, egui::Key::F10, egui::Key::F11, egui::Key::F12,
+    egui::Key::Backslash,
+];
+
+// Имя клавиши для показа и сохранения, напр. "Space", "ArrowRight", "L".
+fn key_label(key: egui::Key) -> String {
+    format!("{:?}", key)
+}
+
+// Обратное преобразование имени в клавишу (для загрузки из файла).
+fn key_from_label(name: &str) -> Option<egui::Key> {
+    BINDABLE_KEYS.iter().copied().find(|k| key_label(*k) == name)
+}
+
+// Клавиши по умолчанию.
+fn default_shortcuts() -> HashMap<Shortcut, egui::Key> {
+    use egui::Key;
+    let mut m = HashMap::new();
+    m.insert(Shortcut::PlayPause, Key::Space);
+    m.insert(Shortcut::Next, Key::ArrowRight);
+    m.insert(Shortcut::Prev, Key::ArrowLeft);
+    m.insert(Shortcut::VolumeUp, Key::ArrowUp);
+    m.insert(Shortcut::VolumeDown, Key::ArrowDown);
+    m.insert(Shortcut::ToggleLike, Key::L);
+    m
+}
+
+// Загружает назначения из файла (отсутствующие берутся из значений по умолчанию).
+fn load_shortcuts() -> HashMap<Shortcut, egui::Key> {
+    let mut map = default_shortcuts();
+    if let Ok(text) = std::fs::read_to_string(SHORTCUTS_FILE) {
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some((code, value)) = line.split_once('=') {
+                if let Some(action) = Shortcut::from_code(code.trim()) {
+                    let value = value.trim();
+                    if value == "None" {
+                        map.remove(&action); // клавиша снята пользователем
+                    } else if let Some(key) = key_from_label(value) {
+                        map.insert(action, key);
+                    }
+                }
+            }
+        }
+    }
+    map
+}
+
+// Сохраняет назначения в файл (по строке на действие).
+fn save_shortcuts(map: &HashMap<Shortcut, egui::Key>) {
+    let mut out = String::new();
+    for &action in Shortcut::all() {
+        let value = match map.get(&action) {
+            Some(&key) => key_label(key),
+            None => "None".to_string(),
+        };
+        out.push_str(&format!("{}={}\n", action.code(), value));
+    }
+    let _ = std::fs::write(SHORTCUTS_FILE, out);
+}
+
+
+// Преобразование клавиши rdev (глобальный хук) в клавишу egui,
+// чтобы сравнивать её с назначенными в настройках.
+// Состояние, общее между потоком-перехватчиком (rdev::grab) и UI:
+// какие клавиши «глотать» и активен ли перехват прямо сейчас.
+struct GrabShared {
+    keys: HashSet<egui::Key>,
+    active: bool,
+}
+
+fn rdev_to_egui(k: rdev::Key) -> Option<egui::Key> {
+    use egui::Key as E;
+    use rdev::Key as R;
+    Some(match k {
+        R::Space => E::Space,
+        R::Return => E::Enter,
+        R::Tab => E::Tab,
+        R::Backspace => E::Backspace,
+        R::Delete => E::Delete,
+        R::Insert => E::Insert,
+        R::Home => E::Home,
+        R::End => E::End,
+        R::PageUp => E::PageUp,
+        R::PageDown => E::PageDown,
+        R::UpArrow => E::ArrowUp,
+        R::DownArrow => E::ArrowDown,
+        R::LeftArrow => E::ArrowLeft,
+        R::RightArrow => E::ArrowRight,
+        R::KeyA => E::A, R::KeyB => E::B, R::KeyC => E::C, R::KeyD => E::D,
+        R::KeyE => E::E, R::KeyF => E::F, R::KeyG => E::G, R::KeyH => E::H,
+        R::KeyI => E::I, R::KeyJ => E::J, R::KeyK => E::K, R::KeyL => E::L,
+        R::KeyM => E::M, R::KeyN => E::N, R::KeyO => E::O, R::KeyP => E::P,
+        R::KeyQ => E::Q, R::KeyR => E::R, R::KeyS => E::S, R::KeyT => E::T,
+        R::KeyU => E::U, R::KeyV => E::V, R::KeyW => E::W, R::KeyX => E::X,
+        R::KeyY => E::Y, R::KeyZ => E::Z,
+        R::Num0 => E::Num0, R::Num1 => E::Num1, R::Num2 => E::Num2, R::Num3 => E::Num3,
+        R::Num4 => E::Num4, R::Num5 => E::Num5, R::Num6 => E::Num6, R::Num7 => E::Num7,
+        R::Num8 => E::Num8, R::Num9 => E::Num9,
+        R::F1 => E::F1, R::F2 => E::F2, R::F3 => E::F3, R::F4 => E::F4,
+        R::F5 => E::F5, R::F6 => E::F6, R::F7 => E::F7, R::F8 => E::F8,
+        R::F9 => E::F9, R::F10 => E::F10, R::F11 => E::F11, R::F12 => E::F12,
+        R::BackSlash => E::Backslash,
+        _ => return None,
+    })
+}
+
+
 struct App {
     playlists: Vec<Playlist>,
     player: Player,
     current_song: String,
+    playback_queue: Vec<String>, // <--- очередь, зафиксированная при запуске трека
     is_playing: bool,
     volume: f32,
     total_duration: Option<Duration>,
@@ -136,6 +575,16 @@ struct App {
     track_meta: HashMap<String, TrackMeta>,
     loader_rx: Receiver<LoaderMsg>,
     search_query: String, // <--- ДОБАВЛЕНО ТУТ
+    show_settings: bool,   // <--- открыто ли окно настроек
+    language: Lang,        // <--- текущий язык интерфейса
+    shortcuts: HashMap<Shortcut, egui::Key>, // <--- назначенные клавиши
+    rebinding: Option<Shortcut>,             // <--- какое действие ждёт нажатие (None = нет)
+    global_key_rx: Receiver<egui::Key>,      // <--- глобальные нажатия (rdev)
+    grab_shared: Arc<Mutex<GrabShared>>,     // <--- что глотать (общее с потоком)
+    update: Arc<Mutex<UpdateState>>,
+    show_new_playlist: bool,     // ← открыт ли ввод имени нового плейлиста
+    new_playlist_name: String,   // ← что пользователь печатает
+    focus_new_playlist: bool,    // ← поставить фокус в поле один раз
 }
 
 // 1. Помещаем функцию на самый верхний уровень, прямо перед main
@@ -207,21 +656,126 @@ impl App {
             println!("⚠️ Не вдалося зберегти список лайків: {:?}", e);
         }
     }
+
+    // Сохраняет составы всех обычных плейлистов (кроме «Понравившаяся музыка»,
+    // у неё свой liked_songs.txt) — чтобы добавленные треки пережили перезапуск.
+    fn save_playlists(&self) {
+        let mut out = String::new();
+        for p in &self.playlists {
+            if p.name == "Понравившаяся музыка" {
+                continue;
+            }
+            if p.songs.is_empty() {
+                // Пустой плейлист — запоминаем хотя бы имя (строка с пустым путём).
+                out.push_str(&p.name);
+                out.push('\t');
+                out.push('\n');
+            } else {
+                for song in &p.songs {
+                    out.push_str(&p.name);
+                    out.push('\t');
+                    out.push_str(song);
+                    out.push('\n');
+                }
+            }
+        }
+        if let Err(e) = std::fs::write(PLAYLISTS_FILE, out) {
+            println!("⚠️ Не удалось сохранить плейлисты: {:?}", e);
+        }
+    }
     fn new(ctx: &egui::Context) -> Self {
         let (tx, loader_rx) = channel();
 
         // Сканирование папок и чтение метаданных (теги + обложки) — самая тяжёлая
         // часть запуска. Уносим её в отдельный поток, чтобы окно открылось мгновенно,
         // а не после загрузки всей фонотеки.
+        // --- ГЛОБАЛЬНЫЕ горячие клавиши (через rdev::grab) ---
+        // grab перехватывает клавиатуру во всей системе и, в отличие от listen,
+        // умеет «глотать» нажатие (вернуть None) — тогда Windows не пикает и
+        // клавиша не уходит в игру. Что именно глотать — берём из grab_shared.
+        let (global_tx, global_key_rx) = channel::<egui::Key>();
+        let grab_shared = Arc::new(Mutex::new(GrabShared {
+            keys: HashSet::new(),
+            active: true,
+        }));
+        let shared_for_thread = grab_shared.clone();
+        let ctx_global = ctx.clone();
+        thread::spawn(move || {
+            let callback = move |event: rdev::Event| -> Option<rdev::Event> {
+                if let rdev::EventType::KeyPress(rkey) = event.event_type {
+                    if let Some(ekey) = rdev_to_egui(rkey) {
+                        let consume = {
+                            let st = shared_for_thread.lock().unwrap();
+                            st.active && st.keys.contains(&ekey)
+                        };
+                        if consume {
+                            let _ = global_tx.send(ekey);
+                            ctx_global.request_repaint(); // будим UI, даже если свёрнуто
+                            return None; // ГЛОТАЕМ клавишу: тишина + не уходит в игру
+                        }
+                    }
+                }
+                Some(event) // остальное пропускаем дальше
+            };
+            if let Err(err) = rdev::grab(callback) {
+                eprintln!("⚠️ Не удалось запустить глобальные хоткеи: {:?}", err);
+            }
+        });
+
+
         let ctx_clone = ctx.clone();
         thread::spawn(move || {
+            // let mut playlists = scan_music("../DownloadedMusic");
+
+            // // Метаданные грузим только для треков библиотеки. Лайки — это копии тех же
+            // // треков, поэтому их пути берём ДО добавления плейлиста лайков, чтобы не
+            // // декодировать одни и те же обложки дважды.
+            // let all_paths: Vec<String> =
+            //     playlists.iter().flat_map(|p| p.songs.iter().cloned()).collect();
+
+            // // Восстанавливаем сохранённый плейлист «Понравившаяся музыка» с диска
+            // // и кладём его в начало — так же, как это делает кнопка-сердечко.
+            // let liked = load_liked_songs();
+            // if !liked.is_empty() {
+            //     playlists.insert(0, Playlist {
+            //         name: "Понравившаяся музыка".to_string(),
+            //         songs: liked,
+            //     });
+            // }
+
             let mut playlists = scan_music("../DownloadedMusic");
 
-            // Метаданные грузим только для треков библиотеки. Лайки — это копии тех же
-            // треков, поэтому их пути берём ДО добавления плейлиста лайков, чтобы не
-            // декодировать одни и те же обложки дважды.
-            let all_paths: Vec<String> =
-                playlists.iter().flat_map(|p| p.songs.iter().cloned()).collect();
+            // Подмешиваем вручную добавленные треки (через «три точки» / правый клик)
+            // из playlists.txt в соответствующие плейлисты.
+            for (name, songs) in load_saved_playlists() {
+                if name == "Понравившаяся музыка" {
+                    continue; // лайки восстанавливаются отдельно ниже
+                }
+                if let Some(p) = playlists.iter_mut().find(|p| p.name == name) {
+                    for s in songs {
+                        // пропускаем дубли и пути к уже удалённым файлам
+                        if std::path::Path::new(&s).exists() && !p.songs.contains(&s) {
+                            p.songs.push(s);
+                        }
+                    }
+                } else {
+                    // Плейлист есть в сохранёнке, но папку сканер не нашёл — создаём заново.
+                    let songs: Vec<String> = songs
+                        .into_iter()
+                        .filter(|s| std::path::Path::new(s).exists())
+                        .collect();
+                    playlists.push(Playlist { name, songs });
+                }
+            }
+
+            // Метаданные (теги + обложки) грузим для треков всех плейлистов,
+            // но каждый путь — только один раз (трек может быть сразу в нескольких).
+            let mut seen_paths = HashSet::new();
+            let all_paths: Vec<String> = playlists
+                .iter()
+                .flat_map(|p| p.songs.iter().cloned())
+                .filter(|s| seen_paths.insert(s.clone()))
+                .collect();
 
             // Восстанавливаем сохранённый плейлист «Понравившаяся музыка» с диска
             // и кладём его в начало — так же, как это делает кнопка-сердечко.
@@ -248,10 +802,43 @@ impl App {
             }
         });
 
+        let update = Arc::new(Mutex::new(UpdateState {
+            checking: true,
+            ..Default::default()
+        }));
+
+        {
+            let update_clone = update.clone();
+
+            std::thread::spawn(move || {
+                let result = self_update::backends::github::Update::configure()
+                    .repo_owner("Px228-Da-Da")
+                    .repo_name("test_dowd")
+                    .bin_name("Elysium")
+                    .show_download_progress(false)
+                    .current_version(env!("CARGO_PKG_VERSION"))
+                    .build();
+
+                if let Ok(updater) = result {
+                    if let Ok(status) = updater.get_latest_release() {
+                        let mut state = update_clone.lock().unwrap();
+
+                        state.checking = false;
+
+                        if status.version != env!("CARGO_PKG_VERSION") {
+                            state.available = true;
+                            state.latest_version = status.version;
+                        }
+                    }
+                }
+            });
+        }
+
         Self {
             playlists: Vec::new(),
             player: Player::new(),
             current_song: String::new(),
+            playback_queue: Vec::new(),
             is_playing: false,
             volume: 0.5,
             total_duration: None,
@@ -261,42 +848,146 @@ impl App {
             track_meta: HashMap::new(),
             loader_rx,
             search_query: String::new(), // <--- ДОБАВЛЕНО ТУТ
+            show_settings: false,         // <--- окно настроек по умолчанию закрыто
+            language: load_language(), // <--- загружаем сохранённый язык
+            shortcuts: load_shortcuts(), // <--- загружаем сохранённые хоткеи
+            rebinding: None,
+            global_key_rx,
+            grab_shared,
+            update,
+            show_new_playlist: false,
+            new_playlist_name: String::new(),
+            focus_new_playlist: false,
         }
     }
 
     fn play_next_track(&mut self) {
-        let current_queue = self.get_current_queue();
-        if current_queue.is_empty() {
+        // Очередь берём из playback_queue — она зафиксирована при запуске трека,
+        // поэтому переключение вкладок (Главная / другой плейлист) на неё не влияет.
+        if self.playback_queue.is_empty() {
             self.is_playing = false;
             return;
         }
 
-        if let Some(current_idx) = current_queue.iter().position(|s| s == &self.current_song) {
+        if let Some(current_idx) = self.playback_queue.iter().position(|s| s == &self.current_song) {
             let next_idx = current_idx + 1;
-            if next_idx < current_queue.len() {
-                self.play_track(&current_queue[next_idx].clone());
+            if next_idx < self.playback_queue.len() {
+                self.play_track(&self.playback_queue[next_idx].clone());
             } else {
                 self.is_playing = false;
                 self.elapsed_duration = Duration::ZERO;
             }
         } else {
-            self.play_track(&current_queue[0].clone());
+            self.play_track(&self.playback_queue[0].clone());
         }
     }
 
     fn play_previous_track(&mut self) {
-        let current_queue = self.get_current_queue();
-        if current_queue.is_empty() { return; }
+        if self.playback_queue.is_empty() { return; }
 
-        if let Some(current_idx) = current_queue.iter().position(|s| s == &self.current_song) {
+        if let Some(current_idx) = self.playback_queue.iter().position(|s| s == &self.current_song) {
             if current_idx > 0 {
-                self.play_track(&current_queue[current_idx - 1].clone());
+                self.play_track(&self.playback_queue[current_idx - 1].clone());
             } else {
                 self.player.seek(&self.current_song, Duration::ZERO);
                 self.elapsed_duration = Duration::ZERO;
             }
         }
     }
+
+    // Выполняет действие горячей клавиши.
+    fn do_shortcut(&mut self, action: Shortcut) {
+        match action {
+            Shortcut::PlayPause => {
+                if self.current_song.is_empty() {
+                    return;
+                }
+                if self.is_playing {
+                    self.player.pause();
+                    self.is_playing = false;
+                } else {
+                    self.player.resume();
+                    self.is_playing = true;
+                }
+            }
+            Shortcut::Next => self.play_next_track(),
+            Shortcut::Prev => self.play_previous_track(),
+            Shortcut::VolumeUp => {
+                self.volume = (self.volume + 0.05).min(1.0);
+                self.player.set_volume(self.volume);
+            }
+            Shortcut::VolumeDown => {
+                self.volume = (self.volume - 0.05).max(0.0);
+                self.player.set_volume(self.volume);
+            }
+            Shortcut::ToggleLike => {
+                if !self.current_song.is_empty() {
+                    let song = self.current_song.clone();
+                    self.toggle_like(&song);
+                }
+            }
+        }
+    }
+
+    // Обрабатывает клавиатуру каждый кадр: переназначение или срабатывание хоткеев.
+    // В фокусе нажатия не нужны: их перехватывает rdev::grab (см. поток в new()).
+    // Здесь оставляем только Esc и захват клавиши при переназначении в настройках.
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+
+        // Ждём нажатие клавиши для переназначения
+        if let Some(action) = self.rebinding {
+            if esc {
+                self.rebinding = None; // Esc — отмена
+            } else if let Some(key) = ctx.input(|i| {
+                i.events.iter().find_map(|e| match e {
+                    egui::Event::Key { key, pressed: true, .. } => Some(*key),
+                    _ => None,
+                })
+            }) {
+                self.shortcuts.insert(action, key);
+                save_shortcuts(&self.shortcuts);
+                self.rebinding = None;
+            }
+            return;
+        }
+
+        // Esc закрывает окно настроек
+        if self.show_settings && esc {
+            self.show_settings = false;
+        }
+    }
+
+
+    // Глобальные хоткеи: срабатывают всегда (в т.ч. когда окно не в фокусе — в игре).
+    // Клавишу «глотает» rdev::grab, поэтому здесь просто выполняем действие.
+    fn handle_global_keys(&mut self, ctx: &egui::Context) {
+        // Сообщаем потоку-перехватчику, какие клавиши глотать и активен ли перехват.
+        {
+            let mut st = self.grab_shared.lock().unwrap();
+            // Не перехватываем в настройках / при переназначении / когда печатаем
+            // в поле поиска — иначе клавишу не получится ни ввести, ни назначить.
+            st.active =
+                !(self.show_settings || self.rebinding.is_some() || ctx.wants_keyboard_input());
+            st.keys = self.shortcuts.values().copied().collect();
+        }
+
+        // Выполняем действия по перехваченным клавишам.
+        while let Ok(key) = self.global_key_rx.try_recv() {
+            if self.show_settings || self.rebinding.is_some() {
+                continue; // опустошаем очередь, но не реагируем
+            }
+            if let Some(action) = self
+                .shortcuts
+                .iter()
+                .find(|(_, &k)| k == key)
+                .map(|(&a, _)| a)
+            {
+                self.do_shortcut(action);
+            }
+        }
+    }
+
 
     fn play_track(&mut self, path: &str) {
         self.current_song = path.to_string();
@@ -335,6 +1026,10 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         apply_custom_theme(ctx);
+
+        let update_info = {
+            self.update.lock().unwrap().clone()
+        };
         
         // Забираем всё, что успел подготовить фоновый загрузчик.
         // try_recv не блокирует кадр: берём что готово и сразу рисуем.
@@ -360,8 +1055,78 @@ impl eframe::App for App {
             }
         }
 
+        if update_info.available {
+            egui::Window::new("Обновление")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(format!(
+                        "Доступна новая версия {}",
+                        update_info.latest_version
+                    ));
+
+                    // Если в прошлый раз произошла ошибка — покажем её красным цветом
+                    if let Some(ref err) = update_info.error {
+                        ui.colored_label(Color32::LIGHT_RED, format!("Ошибка: {}", err));
+                    }
+
+                    // Если идет скачивание — блокируем кнопку и показываем индикатор
+                    if update_info.updating {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Скачивание и замена файла...");
+                        });
+                    } else {
+                        if ui.button("Обновить сейчас").clicked() {
+                            let update_clone = self.update.clone();
+
+                            // Переводим статус в режим загрузки и очищаем старые ошибки
+                            {
+                                let mut state = update_clone.lock().unwrap();
+                                state.updating = true;
+                                state.error = None;
+                            }
+
+                            std::thread::spawn(move || {
+                                let result = self_update::backends::github::Update::configure()
+                                    .repo_owner("Px228-Da-Da")
+                                    .repo_name("test_dowd")
+                                    .bin_name("Elysium")
+                                    .show_download_progress(false) // ВАЖНО: false для GUI-приложений!
+                                    .current_version(env!("CARGO_PKG_VERSION"))
+                                    .build()
+                                    .unwrap()
+                                    .update();
+
+                                let mut state = update_clone.lock().unwrap();
+                                state.updating = false;
+
+                                match result {
+                                    Ok(_) => {
+                                        // Всё прошло успешно, заменяем файл и закрываемся.
+                                        // При следующем ручном запуске откроется новая версия.
+                                        std::process::exit(0);
+                                    }
+                                    Err(e) => {
+                                        // Записываем ошибку в состояние, чтобы вывести её в UI
+                                        state.error = Some(e.to_string());
+                                    }
+                                }
+                            });
+                        }
+                    }
+                });
+        }
+
         let text_muted = Color32::from_rgb(167, 167, 167);
         let accent_color = Color32::from_rgb(29, 185, 84);
+
+        // Все подписи интерфейса на выбранном языке (см. fn strings ниже).
+        let s = strings(self.language);
+
+        // Горячие клавиши: переназначение и срабатывание.
+        self.handle_shortcuts(ctx);
+        self.handle_global_keys(ctx); // глобальные хоткеи (когда окно не в фокусе)
 
         // =============================================================
         // 🎶 НИЖНЯЯ ПАНЕЛЬ УПРАВЛЕНИЯ (Возвращен ваш дизайн)
@@ -422,9 +1187,9 @@ impl eframe::App for App {
                                         .min_size(Vec2::new(34.0, 34.0)),
                                 )
                                 .on_hover_text(if liked {
-                                    "Убрать из «Понравившаяся музыка»"
+                                    s.unlike_hint
                                 } else {
-                                    "Сохранить в «Понравившаяся музыка»"
+                                    s.like_hint
                                 });
                             if heart.clicked() {
                                 self.toggle_like(&song);
@@ -516,13 +1281,13 @@ impl eframe::App for App {
             .frame(egui::Frame::none().fill(Color32::from_rgb(0, 0, 0)).inner_margin(20.0))
             .show(ctx, |ui| {
                 ui.vertical(|ui| {
-                    ui.label(RichText::new("Music App").size(20.0).strong().color(Color32::WHITE));
+                    ui.label(RichText::new("Elysium").size(20.0).strong().color(Color32::WHITE));
                     ui.add_space(25.0);
 
                     // Навигация (структура YT, но ваш стиль)
                     // let nav_items = [("🏠", "Главная"), ("🧭", "Навигатор"), ("📚", "Библиотека")];
                     // Навигация (в стиле закругленной плашки, как на фото 2)
-                    let nav_items = [("🏠", "Главная")];
+                    let nav_items = [("🏠", s.home)];
                     for (i, (icon, name)) in nav_items.iter().enumerate() {
                         let is_active = self.selected_playlist_idx.is_none() && i == 0;
                         
@@ -557,13 +1322,18 @@ impl eframe::App for App {
                     ui.separator();
                     ui.add_space(15.0);
 
-                    // Кнопка Новый (растянутая на всю доступную ширину)
-                    ui.add_sized(
+                    // Кнопка «Новый» — открывает модальное окно создания плейлиста
+                    let add_btn = ui.add_sized(
                         [ui.available_width(), 40.0],
-                        egui::Button::new(RichText::new("➕ Новый").size(16.0).strong())
+                        egui::Button::new(RichText::new(s.new_playlist).size(16.0).strong())
                             .fill(Color32::from_rgb(30, 30, 30))
-                            .rounding(20.0)
+                            .rounding(20.0),
                     );
+                    if add_btn.clicked() {
+                        self.show_new_playlist = true;
+                        self.focus_new_playlist = true;
+                        self.new_playlist_name.clear();
+                    }
                     
                     ui.add_space(25.0);
 
@@ -580,8 +1350,8 @@ impl eframe::App for App {
 
                     // Текст
                     let text_pos = rect.min + vec2(10.0, 8.0);
-                    ui.painter().text(text_pos, egui::Align2::LEFT_TOP, "Понравившаяся музыка", FontId::proportional(15.0), Color32::WHITE);
-                    ui.painter().text(text_pos + vec2(0.0, 20.0), egui::Align2::LEFT_TOP, "📌 Создан автоматически", FontId::proportional(12.0), text_muted);
+                    ui.painter().text(text_pos, egui::Align2::LEFT_TOP, s.liked_music, FontId::proportional(15.0), Color32::WHITE);
+                    ui.painter().text(text_pos + vec2(0.0, 20.0), egui::Align2::LEFT_TOP, s.auto_created, FontId::proportional(12.0), text_muted);
 
                     // Обработка клика (используем usize::MAX как специальный ID для этой страницы)
                     if response.clicked() {
@@ -652,7 +1422,7 @@ impl eframe::App for App {
                     let response = search_ui.add(
                         egui::TextEdit::singleline(&mut self.search_query)
                             .frame(false) // Убираем стандартную рамку
-                            .hint_text(RichText::new("Поиск треков, артистов...").color(text_muted))
+                            .hint_text(RichText::new(s.search_hint).color(text_muted))
                             .text_color(Color32::WHITE)
                             .desired_width(340.0)
                     );
@@ -663,7 +1433,15 @@ impl eframe::App for App {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add(egui::Button::new(RichText::new("👤 User").size(13.0)).rounding(15.0).fill(Color32::from_rgb(10, 10, 10)));
+                        // Клик по кнопке профиля открывает окно настроек
+                        let user_btn = ui.add(
+                            egui::Button::new(RichText::new(s.user).size(13.0))
+                                .rounding(15.0)
+                                .fill(Color32::from_rgb(10, 10, 10)),
+                        );
+                        if user_btn.clicked() {
+                            self.show_settings = true;
+                        }
                     });
                 });
                 ui.add_space(20.0);
@@ -694,9 +1472,9 @@ impl eframe::App for App {
                             
                             ui.label(RichText::new("🤍").size(64.0));
                             ui.add_space(20.0);
-                            ui.label(RichText::new("Понравившаяся музыка").size(28.0).strong().color(Color32::WHITE));
+                            ui.label(RichText::new(s.liked_music).size(28.0).strong().color(Color32::WHITE));
                             ui.add_space(10.0);
-                            ui.label(RichText::new("Здесь пока пусто. Треки, которые вы лайкнете, появятся тут.").size(16.0).color(text_muted));
+                            ui.label(RichText::new(s.liked_empty).size(16.0).color(text_muted));
                         });
                     } else {
                         // -------------------------------------------------------------
@@ -722,16 +1500,24 @@ impl eframe::App for App {
                                     }
 
                                     ui.add_space(16.0);
-                                    ui.label(RichText::new(&playlist.name).size(24.0).strong().color(Color32::WHITE));
+                                    // Заголовок плейлиста: у плейлиста лайков name хранит русский ключ —
+                                    // поэтому для показа подменяем его на перевод s.liked_music.
+                                    let playlist_title: &str = if playlist.name == "Понравившаяся музыка" {
+                                        s.liked_music
+                                    } else {
+                                        playlist.name.as_str()
+                                    };
+                                    ui.label(RichText::new(playlist_title).size(24.0).strong().color(Color32::WHITE));
                                     ui.add_space(4.0);
-                                    ui.label(RichText::new(format!("Плейлист • {} треков", playlist.songs.len())).size(13.0).color(text_muted));
+                                    ui.label(RichText::new(s.playlist_tracks.replace("{n}", &playlist.songs.len().to_string())).size(13.0).color(text_muted));
                                     ui.add_space(12.0);
                                     
-                                    if ui.add(egui::Button::new(RichText::new("   ▶  Play   ").size(15.0).color(Color32::BLACK))
+                                    if ui.add(egui::Button::new(RichText::new(s.play).size(15.0).color(Color32::BLACK))
                                         .fill(accent_color)
                                         .rounding(20.0)
                                         .min_size(vec2(100.0, 36.0))).clicked() {
                                         if !playlist.songs.is_empty() {
+                                            self.playback_queue = self.get_current_queue(); // запоминаем, ОТКУДА играем
                                             self.play_track(&playlist.songs[0]);
                                         }
                                     }
@@ -745,7 +1531,7 @@ impl eframe::App for App {
                                 vec2(ui.available_width(), remaining_height),
                                 egui::Layout::top_down(egui::Align::Min),
                                 |ui| {
-                                    ui.label(RichText::new("Упорядочить").size(13.0).color(text_muted));
+                                    ui.label(RichText::new(s.sort).size(13.0).color(text_muted));
                                     ui.add_space(10.0);
 
                                     // --- НАЧАЛО: Подготовка отфильтрованного списка ---
@@ -796,8 +1582,8 @@ impl eframe::App for App {
 
                                                 // --- Ограничение текста и кнопка лайка ---
                                                 let text_color = if is_active { accent_color } else { Color32::WHITE };
-                                                let title = meta.map(|m| m.title.clone()).unwrap_or_else(|| "Unknown".to_string());
-                                                let artist = meta.and_then(|m| m.artist.clone()).unwrap_or_else(|| "Unknown Artist".to_string());
+                                                let title = meta.map(|m| m.title.clone()).unwrap_or_else(|| s.unknown_title.to_string());
+                                                let artist = meta.and_then(|m| m.artist.clone()).unwrap_or_else(|| s.unknown_artist.to_string());
 
                                                 // Вычисляем доступную ширину для текста (минусуем обложку слева и кнопку лайка справа)
                                                 let max_text_width = rect.width() - img_size - 80.0;
@@ -841,6 +1627,7 @@ impl eframe::App for App {
                                                         if self.is_playing { self.player.pause(); self.is_playing = false; }
                                                         else { self.player.resume(); self.is_playing = true; }
                                                     } else {
+                                                        self.playback_queue = self.get_current_queue(); // запоминаем, ОТКУДА играем
                                                         self.play_track(song);
                                                     }
                                                 }
@@ -879,36 +1666,38 @@ impl eframe::App for App {
                             // Заголовок секции
                             ui.horizontal(|ui| {
                                 ui.vertical(|ui| {
-                                    ui.label(RichText::new("Послушать ещё раз").size(26.0).strong().color(Color32::WHITE));
+                                    ui.label(RichText::new(s.listen_again).size(26.0).strong().color(Color32::WHITE));
                                 });
                             });
                             ui.add_space(20.0);
 
                             // 3. Сетка всех треков (ВАШ ОРИГИНАЛЬНЫЙ ДИЗАЙН КАРТОЧЕК)
-                            // Мы УБРАЛИ отсюда второй ScrollArea::vertical(), так как он теперь общий для всей страницы
                             ui.horizontal_wrapped(|ui| {
                                 ui.spacing_mut().item_spacing = egui::vec2(18.0, 24.0);
 
-                                // «Понравившаяся музыка» — это копии треков, которые уже
-                                // есть в обычных плейлистах. Пропускаем её здесь, иначе
-                                // лайкнутые песни задваивались бы на главной.
                                 let query = self.search_query.to_lowercase(); // <-- Берем текст из поиска
+                                
+                                // --- ИСПРАВЛЕНИЕ: Используем HashSet для дедупликации треков на Главной ---
+                                let mut seen_songs = HashSet::new();
                                 let all_songs: Vec<String> = self
                                     .playlists
                                     .iter()
                                     .filter(|p| p.name != "Понравившаяся музыка")
                                     .flat_map(|p| p.songs.clone())
-                                    // --- НАЧАЛО НОВОГО ФИЛЬТРА ---
                                     .filter(|song| {
+                                        // Если песню уже видели в другом плейлисте, не дублируем её на Главной
+                                        if !seen_songs.insert(song.clone()) {
+                                            return false;
+                                        }
                                         if query.is_empty() { return true; }
                                         let meta = self.track_meta.get(song);
                                         let title = meta.map(|m| m.title.to_lowercase()).unwrap_or_default();
                                         let artist = meta.and_then(|m| m.artist.clone()).unwrap_or_default().to_lowercase();
                                         title.contains(&query) || artist.contains(&query)
                                     })
-                                    // --- КОНЕЦ НОВОГО ФИЛЬТРА ---
                                     .collect();
                                     
+                                let home_queue = all_songs.clone(); // очередь = ровно тот список, что виден на Главной
                                 for song in all_songs {
                                     let meta = self.track_meta.get(&song);
                                     let is_active = self.current_song == song;
@@ -946,20 +1735,18 @@ impl eframe::App for App {
                                     let text_pos = cover_rect.left_bottom() + Vec2::new(0.0, 12.0);
                                     let text_color = if is_active { accent_color } else { Color32::WHITE };
 
-                                    // --- ИСПРАВЛЕНИЕ: Автоматическое ограничение длины текста по ширине карточки ---
-                                    // Доступная ширина для текста: 132px (по ширине обложки). 
-                                    // В пропорциональном шрифте один символ занимает в среднем 7-8px.
+                                    // --- Автоматическое ограничение длины текста по ширине карточки ---
                                     let max_chars_title = 15;
                                     let max_chars_artist = 18;
 
-                                    let title = meta.map(|m| m.title.clone()).unwrap_or_else(|| "Unknown".to_string());
+                                    let title = meta.map(|m| m.title.clone()).unwrap_or_else(|| s.unknown_title.to_string());
                                     let display_name = if title.chars().count() > max_chars_title {
                                         format!("{}...", title.chars().take(max_chars_title - 3).collect::<String>())
                                     } else { title };
 
                                     ui.painter().text(text_pos, egui::Align2::LEFT_TOP, display_name, FontId::proportional(14.0), text_color);
 
-                                    let artist = meta.and_then(|m| m.artist.clone()).unwrap_or_else(|| "Track".to_string());
+                                    let artist = meta.and_then(|m| m.artist.clone()).unwrap_or_else(|| s.unknown_artist.to_string());
                                     let subtitle = if artist.chars().count() > max_chars_artist {
                                         format!("{}...", artist.chars().take(max_chars_artist - 3).collect::<String>())
                                     } else { artist };
@@ -967,16 +1754,14 @@ impl eframe::App for App {
                                     let subtext_pos = text_pos + Vec2::new(0.0, 18.0);
                                     ui.painter().text(subtext_pos, egui::Align2::LEFT_TOP, subtitle, FontId::proportional(12.0), text_muted);
 
-                                    // --- ИСПРАВЛЕНИЕ: Интерактивное и ровное векторное сердечко-кнопка ---
+                                    // --- Интерактивное сердечко ---
                                     let liked = self.is_liked(&song);
                                     let heart_color = if liked { accent_color } else { Color32::from_rgb(100, 100, 100) };
 
-                                    // Выделяем аккуратную квадратную область в правом нижнем углу карточки
                                     let heart_btn_size = vec2(28.0, 28.0);
                                     let heart_btn_pos = pos2(rect.right() - 36.0, rect.bottom() - 36.0);
                                     let heart_rect = Rect::from_min_size(heart_btn_pos, heart_btn_size);
 
-                                    // Рисуем невидимый дочерний UI поверх этой области и вставляем туда кнопку с символом "♥"
                                     let mut heart_ui = ui.new_child(egui::UiBuilder::new().max_rect(heart_rect));
                                     let heart_click = heart_ui.add(
                                         egui::Button::new(RichText::new("♥").size(16.0).color(heart_color))
@@ -984,13 +1769,115 @@ impl eframe::App for App {
                                             .frame(false)
                                     );
 
-                                    // Обработка клика по сердечку карточки
                                     if heart_click.clicked() {
                                         self.toggle_like(&song);
                                     }
 
+                                    // 🛑 ТРИ ВЕРТИКАЛЬНЫЕ ТОЧКИ в правом верхнем углу обложки
+                                    let dots_btn_size = vec2(28.0, 28.0);
+                                    let dots_btn_pos = pos2(rect.right() - 34.0, rect.min.y + 10.0);
+                                    let dots_rect = Rect::from_min_size(dots_btn_pos, dots_btn_size);
+
+                                    // Невидимая кликабельная зона — нет фона/рамки, значит нет «кнопки»
+                                    let dots_id = ui.make_persistent_id(("dots_btn", song.as_str()));
+                                    let dots_resp = ui.interact(dots_rect, dots_id, egui::Sense::click());
+
+                                    // Лёгкая подсветка-«чип» только при наведении
+                                    if dots_resp.hovered() {
+                                        ui.painter().rect_filled(
+                                            dots_rect,
+                                            Rounding::same(6.0),
+                                            Color32::from_black_alpha(70),
+                                        );
+                                    }
+
+                                    // Точки рисуем вручную — не зависит от шрифта, никаких квадратов
+                                    let dot_color = if dots_resp.hovered() {
+                                        Color32::WHITE
+                                    } else {
+                                        Color32::from_gray(210)
+                                    };
+                                    let dot_shadow = Color32::from_black_alpha(130);
+                                    let dc = dots_rect.center();
+                                    let dot_r = 2.0;
+                                    let dot_gap = 6.0;
+                                    for dy in [-dot_gap, 0.0, dot_gap] {
+                                        let p = pos2(dc.x, dc.y + dy);
+                                        // тень — чтобы точки читались поверх светлой обложки
+                                        ui.painter().circle_filled(p + vec2(0.0, 1.0), dot_r + 0.4, dot_shadow);
+                                        ui.painter().circle_filled(p, dot_r, dot_color);
+                                    }
+
+                                    // Меню по клику на точки (выпадает вниз)
+                                    let dots_popup_id = ui.make_persistent_id(("dots_popup", song.as_str()));
+                                    if dots_resp.clicked() {
+                                        ui.ctx().memory_mut(|mem| mem.toggle_popup(dots_popup_id));
+                                    }
+
+                                    let mut dots_clicked = false;
+                                    egui::popup::popup_below_widget(
+                                        ui,
+                                        dots_popup_id,
+                                        &dots_resp,
+                                        egui::popup::PopupCloseBehavior::CloseOnClickOutside,
+                                        |ui| {
+                                            style_menu(ui);
+                                            ui.set_min_width(210.0);
+                                            for p_idx in 0..self.playlists.len() {
+                                                if self.playlists[p_idx].name == "Понравившаяся музыка" {
+                                                    continue;
+                                                }
+                                                let p_name = self.playlists[p_idx].name.clone();
+                                                let already_in = self.playlists[p_idx].songs.contains(&song);
+                                                let label = if already_in { format!("✓ {}", p_name) } else { p_name };
+
+                                                if ui.add(
+                                                    egui::Button::new(
+                                                        RichText::new(label).size(14.0).color(Color32::WHITE),
+                                                    )
+                                                    .min_size(vec2(202.0, 32.0))
+                                                    .rounding(6.0),
+                                                ).clicked() {
+                                                    dots_clicked = true;
+                                                    if !already_in {
+                                                        self.playlists[p_idx].songs.push(song.clone());
+                                                        self.save_playlists();
+                                                    }
+                                                    ui.ctx().memory_mut(|m| m.close_popup());
+                                                }
+                                            }
+                                        },
+                                    );
+                                    // Контекстное меню по правому клику на саму карточку
+                                    response.context_menu(|ui| {
+                                        style_menu(ui);
+                                        ui.set_min_width(210.0);
+                                        for p_idx in 0..self.playlists.len() {
+                                            if self.playlists[p_idx].name == "Понравившаяся музыка" {
+                                                continue;
+                                            }
+                                            let p_name = self.playlists[p_idx].name.clone();
+                                            let already_in = self.playlists[p_idx].songs.contains(&song);
+                                            let label = if already_in { format!("✓ {}", p_name) } else { p_name };
+
+                                            if ui.add(
+                                                egui::Button::new(
+                                                    RichText::new(label).size(14.0).color(Color32::WHITE),
+                                                )
+                                                .min_size(vec2(202.0, 32.0))
+                                                .rounding(6.0),
+                                            ).clicked() {
+                                                if !already_in {
+                                                    self.playlists[p_idx].songs.push(song.clone());
+                                                    self.save_playlists();
+                                                }
+                                                ui.close_menu();
+                                            }
+                                        }
+                                    });
+
                                     // Появление большой кнопки Play (круглый зеленый кружок) при наведении на карточку
-                                    if is_hovered || is_active {
+                                    if (is_hovered || is_active) && !dots_resp.hovered() {
                                         let btn_radius = 22.0;
                                         let btn_center = cover_rect.max - Vec2::new(btn_radius + 4.0, btn_radius + 4.0);
 
@@ -1001,12 +1888,13 @@ impl eframe::App for App {
                                         ui.painter().text(btn_center, egui::Align2::CENTER_CENTER, icon, FontId::proportional(20.0), Color32::BLACK);
                                     }
 
-                                    // Клик по карточке включает трек, только если кликнули МИМО кнопки лайка
-                                    if response.clicked() && !heart_click.clicked() {
+                                    // Клик по карточке включает трек, только если кликнули МИМО всех кнопок управления и меню
+                                    if response.clicked() && !heart_click.clicked() && !dots_resp.clicked() && !dots_clicked {
                                         if is_active {
                                             if self.is_playing { self.player.pause(); self.is_playing = false; }
                                             else { self.player.resume(); self.is_playing = true; }
                                         } else {
+                                            self.playback_queue = home_queue.clone();
                                             self.play_track(&song);
                                         }
                                     }
@@ -1016,7 +1904,327 @@ impl eframe::App for App {
                 }
             });
 
-        ctx.request_repaint();
+        // =============================================================
+        // ⚙ ОКНО НАСТРОЕК — на весь экран, модально (клики за ним заблокированы)
+        // =============================================================
+        if self.show_settings {
+
+            let screen = ctx.screen_rect();
+
+            egui::Area::new(egui::Id::new("settings_overlay"))
+                .order(egui::Order::Foreground) // поверх всех панелей
+                .interactable(true)
+                .fixed_pos(screen.min)
+                .show(ctx, |ui| {
+                    // Рисуем на весь экран, без обрезки по авто-размеру области
+                    ui.set_clip_rect(screen);
+
+                    // Непрозрачный фон на весь экран + перехват ВСЕХ кликов,
+                    // чтобы элементы за окном были недоступны.
+                    let _ = ui.allocate_rect(screen, egui::Sense::click_and_drag());
+                    ui.painter()
+                        .rect_filled(screen, Rounding::same(0.0), Color32::from_rgb(18, 18, 18));
+
+                    // Содержимое настроек поверх фона (с отступом от краёв)
+                    let mut content = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(screen.shrink(40.0))
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+
+                    // Верхняя строка: заголовок слева, кнопка закрытия справа
+                    content.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!("⚙  {}", s.settings))
+                                .size(28.0)
+                                .strong()
+                                .color(Color32::WHITE),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let close = ui.add(
+                                egui::Button::new(RichText::new("✖").size(18.0).color(Color32::WHITE))
+                                    .rounding(18.0)
+                                    .fill(Color32::from_rgb(30, 30, 30)),
+                            );
+                            if close.clicked() {
+                                self.show_settings = false;
+                            }
+                        });
+                    });
+
+                    // --- Выбор языка интерфейса ---
+                    content.add_space(28.0);
+                    content.label(
+                        RichText::new(s.language)
+                            .size(18.0)
+                            .strong()
+                            .color(Color32::WHITE),
+                    );
+                    content.add_space(12.0);
+                    content.horizontal(|ui| {
+                        // Кнопка для каждого языка из Lang::all()
+                        for &lang in Lang::all() {
+                            let active = self.language == lang;
+                            let bg = if active {
+                                accent_color
+                            } else {
+                                Color32::from_rgb(35, 35, 35)
+                            };
+                            let fg = if active { Color32::BLACK } else { Color32::WHITE };
+                            let btn = ui.add(
+                                egui::Button::new(
+                                    RichText::new(lang.native_name()).size(15.0).color(fg),
+                                )
+                                .min_size(vec2(160.0, 42.0))
+                                .rounding(10.0)
+                                .fill(bg),
+                            );
+                            if btn.clicked() {
+                                self.language = lang; // переключаем язык
+                                save_language(lang);  // и сразу запоминаем на диск
+                            }
+                            ui.add_space(12.0);
+                        }
+                    });
+
+                    // --- Горячие клавиши ---
+                    content.add_space(40.0);
+                    content.label(
+                        RichText::new(s.shortcuts)
+                            .size(18.0)
+                            .strong()
+                            .color(Color32::WHITE),
+                    );
+                    content.add_space(12.0);
+                    for &action in Shortcut::all() {
+                        content.horizontal(|ui| {
+                            // Название действия (фикс. ширина для выравнивания)
+                            ui.allocate_ui_with_layout(
+                                vec2(240.0, 30.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(action.label(self.language))
+                                            .size(15.0)
+                                            .color(Color32::WHITE),
+                                    );
+                                },
+                            );
+
+                            // Кнопка с текущей клавишей (клик — ждать нажатие)
+                            let listening = self.rebinding == Some(action);
+                            let key_text = if listening {
+                                s.press_key.to_string()
+                            } else {
+                                match self.shortcuts.get(&action) {
+                                    Some(&key) => key_label(key),
+                                    None => s.not_set.to_string(),
+                                }
+                            };
+                            let bg = if listening {
+                                accent_color
+                            } else {
+                                Color32::from_rgb(35, 35, 35)
+                            };
+                            let fg = if listening { Color32::BLACK } else { Color32::WHITE };
+                            let key_btn = ui.add(
+                                egui::Button::new(RichText::new(key_text).size(14.0).color(fg))
+                                    .min_size(vec2(190.0, 30.0))
+                                    .rounding(8.0)
+                                    .fill(bg),
+                            );
+                            if key_btn.clicked() {
+                                self.rebinding = if listening { None } else { Some(action) };
+                            }
+
+                            ui.add_space(8.0);
+
+                            // Очистить назначение
+                            let clear = ui.add(
+                                egui::Button::new(RichText::new("🗑").size(14.0).color(text_muted))
+                                    .min_size(vec2(34.0, 30.0))
+                                    .rounding(8.0)
+                                    .fill(Color32::from_rgb(30, 30, 30)),
+                            );
+                            if clear.clicked() {
+                                self.shortcuts.remove(&action);
+                                save_shortcuts(&self.shortcuts);
+                                if self.rebinding == Some(action) {
+                                    self.rebinding = None;
+                                }
+                            }
+                        });
+                        content.add_space(8.0);
+                    }
+
+                    // --- Прочие настройки (пока заглушка) ---
+                    content.add_space(28.0);
+                    content.horizontal(|ui| {
+                        ui.label(RichText::new("🛠").size(20.0));
+                        ui.add_space(8.0);
+                        ui.vertical(|ui| {
+                            ui.label(
+                                RichText::new(s.settings_in_dev)
+                                    .size(14.0)
+                                    .strong()
+                                    .color(Color32::WHITE),
+                            );
+                            ui.label(
+                                RichText::new(s.settings_in_dev_sub)
+                                    .size(12.0)
+                                    .color(text_muted),
+                            );
+                        });
+                    });
+                });
+        }
+
+        // =============================================================
+        // ➕ ОКНО «НОВЫЙ ПЛЕЙЛИСТ» — небольшое модальное окно по центру экрана
+        // =============================================================
+        if self.show_new_playlist {
+            let screen = ctx.screen_rect();
+            let win_rect = Rect::from_center_size(screen.center(), vec2(360.0, 190.0));
+
+            egui::Area::new(egui::Id::new("new_playlist_overlay"))
+                .order(egui::Order::Foreground)
+                .interactable(true)
+                .fixed_pos(screen.min)
+                .show(ctx, |ui| {
+                    ui.set_clip_rect(screen);
+
+                    // Затемняем фон и перехватываем клики за окном
+                    let _ = ui.allocate_rect(screen, egui::Sense::click_and_drag());
+                    ui.painter().rect_filled(screen, Rounding::same(0.0), Color32::from_black_alpha(160));
+
+                    // Esc закрывает окно
+                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        self.new_playlist_name.clear();
+                        self.show_new_playlist = false;
+                    }
+
+                    // Карточка окна
+                    ui.painter().rect_filled(win_rect, Rounding::same(14.0), Color32::from_rgb(28, 28, 28));
+
+                    let mut content = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(win_rect.shrink(20.0))
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+
+                    content.label(RichText::new(s.new_playlist_title).size(20.0).strong().color(Color32::WHITE));
+                    content.add_space(16.0);
+
+                    // Поле ввода: свой скруглённый фон + безрамочный TextEdit по центру
+                    let field_h = 44.0;
+                    let (field_rect, _) = content.allocate_exact_size(
+                        vec2(content.available_width(), field_h),
+                        egui::Sense::hover(),
+                    );
+
+                    // Фон поля
+                    content.painter().rect_filled(
+                        field_rect,
+                        Rounding::same(10.0),
+                        Color32::from_rgb(20, 20, 20),
+                    );
+
+                    // Сам ввод — без рамки, с отступом слева, по центру по вертикали
+                    let mut field_ui = content.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(field_rect.shrink2(vec2(14.0, 0.0)))
+                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    );
+                    let resp = field_ui.add(
+                        egui::TextEdit::singleline(&mut self.new_playlist_name)
+                            .hint_text(RichText::new(s.new_playlist_hint).color(text_muted))
+                            .frame(false)
+                            .desired_width(f32::INFINITY),
+                    );
+
+                    if self.focus_new_playlist {
+                        resp.request_focus();
+                        self.focus_new_playlist = false;
+                    }
+
+                    // Акцентная линия снизу, когда поле в фокусе
+                    if resp.has_focus() {
+                        let underline = Rect::from_min_max(
+                            pos2(field_rect.left() + 6.0, field_rect.bottom() - 3.0),
+                            pos2(field_rect.right() - 6.0, field_rect.bottom() - 1.0),
+                        );
+                        content.painter().rect_filled(underline, Rounding::same(2.0), accent_color);
+                    }
+
+                    let enter_pressed =
+                        resp.lost_focus() && content.input(|i| i.key_pressed(egui::Key::Enter));
+
+                    content.add_space(22.0);
+
+                    let mut do_create = enter_pressed;
+                    let mut do_cancel = false;
+                    content.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Кнопка "Создать"
+                        if ui.add(
+                            egui::Button::new(RichText::new(s.create).size(15.0).color(Color32::BLACK))
+                                .fill(accent_color)
+                                .rounding(18.0)
+                                .min_size(vec2(120.0, 36.0)),
+                        ).clicked() {
+                            do_create = true;
+                        }
+                        
+                        ui.add_space(10.0);
+                        
+                        // Кнопка "Отмена"
+                        if ui.add(
+                            egui::Button::new(RichText::new(s.cancel).size(15.0).color(Color32::WHITE))
+                                .fill(Color32::from_rgb(45, 45, 45))
+                                .rounding(18.0)
+                                .min_size(vec2(120.0, 36.0)),
+                        ).clicked() {
+                            do_cancel = true;
+                        }
+                    });
+
+                    // --- ВОТ СЮДА НУЖНО ДОБАВИТЬ ЛОГИКУ, ГДЕ ВЫ ОБРАБАТЫВАЕТЕ do_create ---
+                    if do_create {
+                        let name = self.new_playlist_name.trim().to_string();
+                        if !name.is_empty() {
+                            // 1. Создаем папку
+                            // Используем "../DownloadedMusic", так как это путь из вашего кода
+                            let path = std::path::Path::new("../DownloadedMusic").join(&name);
+                            if let Err(e) = std::fs::create_dir_all(&path) {
+                                eprintln!("Ошибка при создании папки: {}", e);
+                            }
+
+                            // 2. Добавляем в список
+                            self.playlists.push(Playlist { name, songs: Vec::new() });
+                            self.selected_playlist_idx = Some(self.playlists.len() - 1);
+                            self.save_playlists();
+                        }
+                        self.new_playlist_name.clear();
+                        self.show_new_playlist = false;
+                    }
+
+                    if do_cancel {
+                        self.new_playlist_name.clear();
+                        self.show_new_playlist = false;
+                    } else if do_create {
+                        let name = self.new_playlist_name.trim().to_string();
+                        if !name.is_empty() {
+                            self.playlists.push(Playlist { name, songs: Vec::new() });
+                            self.selected_playlist_idx = Some(self.playlists.len() - 1);
+                        }
+                        self.new_playlist_name.clear();
+                        self.show_new_playlist = false;
+                    }
+                });
+        }
+
+        // ctx.request_repaint();
+        // Запрашиваем перерисовку не сразу, а через 50 миллисекунд (~20 FPS)
+        ctx.request_repaint_after(std::time::Duration::from_millis(50));
     }
 }
 
@@ -1027,7 +2235,7 @@ fn main() {
         .with_min_inner_size([900.0, 600.0]);
         
     let _ = eframe::run_native(
-        "Music Desktop",
+        "Elysium",
         options,
         Box::new(|cc| {
             // ВАЖНО: Применяем шрифты до создания самого приложения!

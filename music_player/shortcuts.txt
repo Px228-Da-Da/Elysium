@@ -1,0 +1,6 @@
+play_pause=Backslash
+next=End
+prev=None
+vol_up=PageUp
+vol_down=PageDown
+like=None
