@@ -1,3 +1,15 @@
-target/ 
-**/*.rs.bk 
-.cargo-ok 
+# Виртуальное окружение Python
+venv/
+
+# Локальные файлы и загрузки
+DownloadedMusic/
+
+# Секретные данные и авторизация (никогда не коммитьте это!)
+cookies.txt
+oauth.json
+
+# Сборочные/скомпилированные файлы
+music_player/target/
+
+# Скрипты (добавлено по вашему запросу)
+ytmusic_downloader.py

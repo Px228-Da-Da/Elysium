@@ -6,13 +6,18 @@ edition = "2021"
 [dependencies]
 eframe = "0.29"
 egui = "0.29"
-rodio = "0.17"
+rodio = "0.20"
 walkdir = "2"
 mp3-duration = "0.1.10"
 id3 = "1.17.0"
 image = "0.25.10"
 rdev = { version = "0.5", features = ["unstable_grab"] }
-reqwest = { version = "0.12", features = ["blocking", "json"] }
-serde = { version = "1", features = ["derive"] }
 self_update = "0.42"
 tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+unicode-normalization = "0.1"
+serde_json = "1"
+dirs = "5"
+ureq = "2"
+zip = "2"
