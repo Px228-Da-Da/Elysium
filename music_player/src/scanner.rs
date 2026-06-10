@@ -117,6 +117,11 @@ pub fn get_synced_lyrics(file_path: &str) -> Option<Vec<LyricLine>> {
         found = true;
         let mut lines = Vec::new();
         for (time, text) in &sync_lyric.content {
+            // Drop credit/metadata lines our font cannot render (see
+            // `contains_unrenderable`).
+            if contains_unrenderable(text) {
+                continue;
+            }
             lines.push(LyricLine {
                 time_ms: *time,
                 text: text.to_string(),
@@ -426,6 +431,26 @@ fn netease_lyrics(title: &str, artist: &str, dur_secs: Option<u64>) -> Option<Ve
 /// deciseconds (×100), 3+ digits are taken as milliseconds. Empty lines are
 /// kept as a single space so the lyrics view preserves spacing. Returns `None`
 /// when nothing parseable was found.
+/// Returns `true` if `s` contains characters the bundled font cannot render
+/// (East Asian scripts), which would otherwise appear as empty boxes.
+///
+/// The font covers Latin, Cyrillic and emoji but no CJK/Japanese/Korean, so
+/// such text is always provider metadata (composer/lyricist credits) rather
+/// than singable lyrics — dropping it is strictly better than showing boxes.
+fn contains_unrenderable(s: &str) -> bool {
+    s.chars().any(|c| {
+        matches!(c as u32,
+            0x3000..=0x303F   // CJK symbols and punctuation
+            | 0x3040..=0x30FF // Hiragana + Katakana
+            | 0x3400..=0x4DBF // CJK Extension A
+            | 0x4E00..=0x9FFF // CJK Unified Ideographs
+            | 0xAC00..=0xD7AF // Hangul syllables
+            | 0xF900..=0xFAFF // CJK compatibility ideographs
+            | 0xFF00..=0xFFEF // Halfwidth/Fullwidth forms
+        )
+    })
+}
+
 pub fn parse_lrc_string(content: &str) -> Option<Vec<LyricLine>> {
     let mut lines = Vec::new();
     for line in content.lines() {
@@ -439,6 +464,12 @@ pub fn parse_lrc_string(content: &str) -> Option<Vec<LyricLine>> {
 
         let time_str = &line[1..close_idx];
         let text = line[close_idx + 1..].trim().to_string();
+
+        // Skip lines our font cannot render (NetEase prepends East Asian credit
+        // lines like "作词 : ..." which would show as missing-glyph boxes).
+        if contains_unrenderable(&text) {
+            continue;
+        }
 
         let parts: Vec<&str> = time_str.split(':').collect();
         if parts.len() != 2 {

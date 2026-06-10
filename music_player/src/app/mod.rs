@@ -99,6 +99,16 @@ pub struct App {
     selected_playlist_idx: Option<usize>,
     search_query: String,
 
+    /// Cached Home track list (deduplicated across playlists + search-filtered).
+    /// With large libraries (thousands of tracks) rebuilding this every frame is
+    /// expensive, so it is recomputed only when its inputs change — see
+    /// [`App::home_track_list`] and the signature in [`App::home_cache_sig`].
+    home_cache: Vec<String>,
+    /// Signature the cache was built for: `(playlist count, total song count,
+    /// loaded-metadata count, search query)`. When it changes, the cache is
+    /// rebuilt.
+    home_cache_sig: (usize, usize, usize, String),
+
     // --- Background loading channel ---
     /// Receiver for messages from the background scanner/metadata loader.
     loader_rx: Receiver<LoaderMsg>,
@@ -109,6 +119,11 @@ pub struct App {
     // --- Settings / localization ---
     show_settings: bool,
     language: Lang,
+
+    /// Whether the full "Now Playing" view (big cover + synced lyrics, with a
+    /// cover-adaptive background) is open. Toggled by clicking the bottom-bar
+    /// cover; closed by its chevron.
+    show_now_playing: bool,
 
     // --- Hotkeys ---
     /// Current action → key bindings.
@@ -166,6 +181,10 @@ impl App {
     ///    streams per-track metadata (tags + covers) back to the UI.
     /// 3. Update checker — asks GitHub whether a newer release exists.
     pub fn new(ctx: &egui::Context) -> Self {
+        // Apply the theme once at startup. egui keeps visuals until changed, so
+        // there is no need to rebuild them every frame.
+        crate::theme::apply_custom_theme(ctx);
+
         let (tx, loader_rx) = channel();
         // Extra sender so drag-and-drop imports can request metadata loading.
         let loader_tx = tx.clone();
@@ -282,6 +301,7 @@ impl App {
         }));
         {
             let update_clone = update.clone();
+            let ctx_update = ctx.clone();
             thread::spawn(move || {
                 let result = self_update::backends::github::Update::configure()
                     .repo_owner("Px228-Da-Da")
@@ -304,6 +324,8 @@ impl App {
                         if newer {
                             state.available = true;
                             state.latest_version = latest;
+                            // Wake the UI so the prompt shows even if it is idle.
+                            ctx_update.request_repaint();
                         }
                     }
                 }
@@ -325,8 +347,11 @@ impl App {
             loader_rx,
             loader_tx,
             search_query: String::new(),
+            home_cache: Vec::new(),
+            home_cache_sig: (0, 0, 0, String::new()),
             show_settings: false,
             language: load_language(),
+            show_now_playing: false,
             shortcuts: load_shortcuts(),
             rebinding: None,
             global_key_rx,
@@ -373,8 +398,6 @@ impl eframe::App for App {
                 }
             }
         }
-
-        crate::theme::apply_custom_theme(ctx);
 
         // 3. Drain the loader channel: take whatever is ready, draw it now.
         while let Ok(msg) = self.loader_rx.try_recv() {
@@ -424,10 +447,16 @@ impl eframe::App for App {
         self.ui_settings(ctx);
         self.ui_new_playlist(ctx);
         self.ui_rename_playlist(ctx);
-        self.ui_lyrics_window(ctx);
         self.ui_drop_hint(ctx);
 
-        // Repaint at ~20 FPS rather than continuously, to limit CPU use.
-        ctx.request_repaint_after(Duration::from_millis(50));
+        // Only schedule periodic repaints while there is something to animate:
+        // playback progress + lyrics, or a pending lyrics fetch. When fully idle
+        // (paused, nothing loading) the UI sleeps until the next input or
+        // background event — a large CPU/GPU saving on weak machines. Background
+        // loader threads call `request_repaint` themselves when they have data,
+        // and any mouse/keyboard input wakes the UI on its own.
+        if self.is_playing || self.lyrics_receiver.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
     }
 }

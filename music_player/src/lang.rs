@@ -105,6 +105,8 @@ pub struct Strings {
     pub shortcuts: &'static str,
     pub press_key: &'static str,
     pub not_set: &'static str,
+    pub lyrics_searching: &'static str,
+    pub lyrics_not_found: &'static str,
 }
 
 /// Returns the full label table for `lang`.
@@ -140,6 +142,8 @@ pub fn strings(lang: Lang) -> Strings {
             shortcuts: "Горячие клавиши",
             press_key: "Нажмите клавишу…",
             not_set: "не задано",
+            lyrics_searching: "Ищем текст песни…",
+            lyrics_not_found: "Текст песни не найден",
         },
         Lang::Uk => Strings {
             search_hint: "Пошук треків, виконавців...",
@@ -169,6 +173,8 @@ pub fn strings(lang: Lang) -> Strings {
             shortcuts: "Гарячі клавіші",
             press_key: "Натисніть клавішу…",
             not_set: "не призначено",
+            lyrics_searching: "Шукаємо текст пісні…",
+            lyrics_not_found: "Текст пісні не знайдено",
         },
         Lang::En => Strings {
             search_hint: "Search tracks, artists...",
@@ -198,6 +204,8 @@ pub fn strings(lang: Lang) -> Strings {
             shortcuts: "Hotkeys",
             press_key: "Press a key…",
             not_set: "not set",
+            lyrics_searching: "Searching for lyrics…",
+            lyrics_not_found: "Lyrics not found",
         },
     }
 }

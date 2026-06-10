@@ -76,7 +76,8 @@ src/
 │       ├── playlist_page.rs A playlist / the Liked music page.
 │       ├── settings.rs      Language + hotkey settings overlay.
 │       ├── modals.rs        Update prompt, New playlist, Rename dialogs.
-│       └── lyrics.rs        Floating lyrics window + drag hint overlay.
+│       ├── now_playing.rs   Full cover + synced-lyrics view (adaptive background).
+│       └── lyrics.rs        Drag-and-drop hint overlay.
 ├── player.rs          rodio wrapper: play, pause, seek (background), volume.
 ├── scanner.rs         Folder scanning + lyrics lookup (embedded + online).
 ├── meta.rs            Per-track metadata: title, artist, cover texture.

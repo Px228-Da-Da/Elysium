@@ -39,6 +39,21 @@ impl App {
                 let total_w = ui.available_width();
                 let col_w = total_w / 3.0;
 
+                // Clicking anywhere on the bar toggles the full Now Playing view
+                // (like YouTube Music). Registered first, so the controls below
+                // (buttons/sliders) sit on top and capture their own clicks;
+                // only clicks on empty areas fall through to here.
+                if !self.current_song.is_empty() {
+                    let bar_rect = ui.max_rect();
+                    let bar = ui.interact(bar_rect, ui.id().with("now_playing_bar"), egui::Sense::click());
+                    if bar.clicked() {
+                        self.show_now_playing = !self.show_now_playing;
+                    }
+                    if bar.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                }
+
                 ui.horizontal(|ui| {
                     // --- LEFT: cover + track info + like button ---
                     ui.allocate_ui_with_layout(

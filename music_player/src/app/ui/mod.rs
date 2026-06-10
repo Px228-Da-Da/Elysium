@@ -20,6 +20,7 @@ mod central;
 mod home_page;
 mod lyrics;
 mod modals;
+mod now_playing;
 mod playlist_page;
 mod settings;
 mod sidebar;

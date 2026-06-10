@@ -12,76 +12,155 @@ use eframe::egui;
 use egui::{pos2, vec2, Color32, FontId, Rect, RichText, Rounding, Stroke, Vec2};
 use std::collections::HashSet;
 
+/// Card geometry (logical pixels). Kept as constants because the virtualized
+/// grid needs them up front to compute which rows are visible.
+const CARD_W: f32 = 160.0;
+const CARD_H: f32 = 240.0;
+const GAP_X: f32 = 18.0;
+const GAP_Y: f32 = 24.0;
+
 impl App {
+    /// Returns the cached Home track list, rebuilding it only when its inputs
+    /// changed (playlists, loaded metadata or the search query).
+    ///
+    /// The list is deduplicated across playlists and filtered by the search
+    /// query; Liked music is excluded because its tracks already appear via
+    /// their source playlists. For a large library this avoids rebuilding a
+    /// multi-thousand-entry list on every frame.
+    fn home_track_list(&mut self) -> &[String] {
+        let total_songs: usize = self
+            .playlists
+            .iter()
+            .filter(|p| p.name != LIKED_PLAYLIST_NAME)
+            .map(|p| p.songs.len())
+            .sum();
+        // Loaded-metadata count only affects the result while searching (the
+        // filter reads titles/artists). When not searching it is held at 0 so
+        // streaming covers in at startup does not trigger needless rebuilds.
+        let meta_sig = if self.search_query.is_empty() {
+            0
+        } else {
+            self.track_meta.len()
+        };
+        let sig = (
+            self.playlists.len(),
+            total_songs,
+            meta_sig,
+            self.search_query.clone(),
+        );
+
+        if sig != self.home_cache_sig {
+            let query = self.search_query.to_lowercase();
+            let mut seen_songs = HashSet::new();
+            self.home_cache = self
+                .playlists
+                .iter()
+                .filter(|p| p.name != LIKED_PLAYLIST_NAME)
+                .flat_map(|p| p.songs.iter().cloned())
+                .filter(|song| {
+                    if !seen_songs.insert(song.clone()) {
+                        return false; // already shown via another playlist
+                    }
+                    if query.is_empty() {
+                        return true;
+                    }
+                    let meta = self.track_meta.get(song);
+                    let title = meta.map(|m| m.title.to_lowercase()).unwrap_or_default();
+                    let artist =
+                        meta.and_then(|m| m.artist.clone()).unwrap_or_default().to_lowercase();
+                    title.contains(&query) || artist.contains(&query)
+                })
+                .collect();
+            self.home_cache_sig = sig;
+        }
+
+        &self.home_cache
+    }
+
     /// Draws the Home page card grid.
+    ///
+    /// The grid is **virtualized**: only the cards inside the visible viewport
+    /// are built and drawn. With thousands of tracks this is the difference
+    /// between processing ~30 widgets per frame and processing all of them.
     pub(in crate::app) fn ui_home_page(&mut self, ui: &mut egui::Ui) {
         let s = strings(self.language);
 
-        // Wrap the whole page in one vertical scroll area.
+        // Fixed heading above the scroll area.
+        ui.label(RichText::new(s.listen_again).size(26.0).strong().color(Color32::WHITE));
+        ui.add_space(20.0);
+
+        // Refresh (or reuse) the cached list.
+        self.home_track_list();
+        if self.home_cache.is_empty() {
+            return;
+        }
+
+        let row_h = CARD_H + GAP_Y;
+        let mut to_play: Option<String> = None;
+
         egui::ScrollArea::vertical()
             .id_salt("main_page_vertical_scroll")
-            .show(ui, |ui| {
-                // Section heading.
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new(s.listen_again).size(26.0).strong().color(Color32::WHITE));
-                    });
-                });
-                ui.add_space(20.0);
+            .auto_shrink([false, false])
+            .show_viewport(ui, |ui, viewport| {
+                let n = self.home_cache.len();
+                // Columns that fit the actual content width; rows follow.
+                let avail_w = ui.available_width();
+                let cols = (((avail_w + GAP_X) / (CARD_W + GAP_X)).floor() as usize).max(1);
+                let rows = n.div_ceil(cols);
+                let total_h = rows as f32 * row_h;
 
-                // Card grid.
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(18.0, 24.0);
+                // Reserve the full virtual height so the scrollbar is correct;
+                // `origin` is the top-left of the (scrolling) content.
+                let (reserved, _) = ui.allocate_exact_size(vec2(avail_w, total_h), egui::Sense::hover());
+                let origin = reserved.min;
 
-                    let query = self.search_query.to_lowercase();
+                // Only the rows intersecting the viewport need to be drawn.
+                let first_row = (viewport.min.y / row_h).floor().max(0.0) as usize;
+                let last_row = ((viewport.max.y / row_h).ceil() as usize).min(rows);
 
-                    // Collect every track once (deduplicated across playlists),
-                    // applying the search filter. Liked music is excluded — its
-                    // tracks already appear via their source playlists.
-                    let mut seen_songs = HashSet::new();
-                    let all_songs: Vec<String> = self
-                        .playlists
-                        .iter()
-                        .filter(|p| p.name != LIKED_PLAYLIST_NAME)
-                        .flat_map(|p| p.songs.clone())
-                        .filter(|song| {
-                            if !seen_songs.insert(song.clone()) {
-                                return false; // already shown via another playlist
-                            }
-                            if query.is_empty() {
-                                return true;
-                            }
-                            let meta = self.track_meta.get(song);
-                            let title = meta.map(|m| m.title.to_lowercase()).unwrap_or_default();
-                            let artist =
-                                meta.and_then(|m| m.artist.clone()).unwrap_or_default().to_lowercase();
-                            title.contains(&query) || artist.contains(&query)
-                        })
-                        .collect();
+                for row in first_row..last_row {
+                    for col in 0..cols {
+                        let idx = row * cols + col;
+                        if idx >= n {
+                            break;
+                        }
+                        let x = origin.x + col as f32 * (CARD_W + GAP_X);
+                        let y = origin.y + row as f32 * row_h;
+                        let rect = Rect::from_min_size(pos2(x, y), vec2(CARD_W, CARD_H));
 
-                    // The queue equals exactly the list shown on Home.
-                    let home_queue = all_songs.clone();
-                    for song in all_songs {
-                        self.draw_home_card(ui, &song, &home_queue, &s);
+                        // Clone just this one (visible) song so the `self` borrow
+                        // is free for the &mut call below.
+                        let song = self.home_cache[idx].clone();
+                        if self.draw_home_card(ui, rect, &song, &s) {
+                            to_play = Some(song);
+                        }
                     }
-                });
+                }
             });
+
+        // Start a new track outside the draw loop: install the full Home list as
+        // the playback queue (so next/prev walk it), then play.
+        if let Some(song) = to_play {
+            self.playback_queue = self.home_cache.clone();
+            self.play_track(&song);
+        }
     }
 
-    /// Draws a single Home card for `song` and handles its interactions.
-    /// `home_queue` is the queue to install if the card is played.
+    /// Draws a single Home card for `song` at the given `rect` and handles its
+    /// interactions. Returns `true` when the card was clicked to start playing a
+    /// new track (the caller installs the queue and starts playback); play/pause
+    /// of the already-active track is handled inline.
     fn draw_home_card(
         &mut self,
         ui: &mut egui::Ui,
+        rect: Rect,
         song: &str,
-        home_queue: &[String],
         s: &crate::lang::Strings,
-    ) {
+    ) -> bool {
         let meta = self.track_meta.get(song);
         let is_active = self.current_song == *song;
 
-        let card_size = Vec2::new(160.0, 240.0);
-        let (rect, response) = ui.allocate_exact_size(card_size, egui::Sense::click());
+        let response = ui.interact(rect, ui.make_persistent_id(("home_card", song)), egui::Sense::click());
         let is_hovered = response.hovered();
 
         let bg_color = if is_hovered { Color32::from_rgb(40, 40, 40) } else { Color32::from_rgb(24, 24, 24) };
@@ -199,6 +278,7 @@ impl App {
         // Card click plays the track, but only if no control/menu was clicked.
         if response.clicked() && !heart_click.clicked() && !dots_resp.clicked() && !dots_clicked {
             if is_active {
+                // Toggle the already-playing track in place (no queue needed).
                 if self.is_playing {
                     self.player.pause();
                     self.is_playing = false;
@@ -207,10 +287,11 @@ impl App {
                     self.is_playing = true;
                 }
             } else {
-                self.playback_queue = home_queue.to_vec();
-                self.play_track(song);
+                // Signal the caller to start this track with the Home queue.
+                return true;
             }
         }
+        false
     }
 
     /// Draws the shared "add this track to a playlist" menu body (used by both

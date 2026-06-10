@@ -43,7 +43,11 @@ single orchestrator. Order matters and is intentional:
 files; 6. advance playback time + auto-advance at end of track; 7. keyboard +
 global hotkeys; 8. draw panels, then overlays (`ui_update_modal`, `ui_bottom_bar`,
 `ui_sidebar`, `ui_central`, `ui_settings`, `ui_new_playlist`, `ui_rename_playlist`,
-`ui_lyrics_window`, `ui_drop_hint`); 9. `request_repaint_after(50ms)` (~20 FPS).
+`ui_drop_hint`); 9. schedule the next repaint **only when
+there is something to animate** — `request_repaint_after(100ms)` while playing or
+while a lyrics fetch is pending; otherwise the UI sleeps until the next input or
+background event. Do not add an unconditional repaint here: idle sleeping is the
+main CPU saving on weak machines.
 
 **Nothing blocks the UI thread.** All slow work runs on background threads spawned
 in `App::new` (hotkey grab, library scan + metadata stream, update check) or
@@ -102,6 +106,16 @@ dropped files). Results return via `mpsc` channels and `ctx.request_repaint()`.
 
 - **Lyrics caching.** `play_track` checks `lyrics_cache` before spawning a fetch;
   successful fetches are cached in `update` step 2. Don't refetch on cache hit.
+
+- **The Home grid and playlist list are virtualized — keep them that way.**
+  egui is immediate-mode: drawing all cards/rows every frame is O(library size)
+  and dominates CPU on large libraries (thousands of tracks). `home_page.rs`
+  draws only the cards intersecting the viewport (`ScrollArea::show_viewport`
+  with manual row math) and caches the deduped/filtered list in `App::home_cache`
+  (rebuilt only when `home_cache_sig` changes). `playlist_page.rs` uses
+  `ScrollArea::show_rows`. Do **not** revert to a plain `for song in … { draw }`
+  loop over the whole list, and keep `draw_home_card` taking an explicit `rect`
+  (it is positioned manually, not via `allocate_exact_size`).
 
 - **`MUSIC_ROOT` is relative** (`../DownloadedMusic`), resolved against the
   working directory. Tests/launches from a different CWD will scan a different

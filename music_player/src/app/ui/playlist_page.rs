@@ -184,13 +184,18 @@ impl App {
                         })
                         .collect();
 
+                    // Virtualized list: only the rows visible in the viewport are
+                    // built/drawn, so a playlist with thousands of tracks costs
+                    // the same per frame as a small one. Rows are a uniform
+                    // height, which is exactly what `show_rows` needs.
+                    let row_height = 56.0;
                     egui::ScrollArea::vertical()
                         .id_salt("playlist_tracks_scroll")
                         .auto_shrink([false, false])
                         .max_height(remaining_height - 40.0)
-                        .show(ui, |ui| {
-                            for song in filtered_songs {
-                                self.draw_track_row(ui, song, &s);
+                        .show_rows(ui, row_height, filtered_songs.len(), |ui, range| {
+                            for i in range {
+                                self.draw_track_row(ui, filtered_songs[i], &s);
                             }
                         });
 

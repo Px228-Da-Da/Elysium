@@ -15,6 +15,30 @@ pub struct TrackMeta {
     pub artist: Option<String>,
     /// Decoded cover art uploaded as a GPU texture, if the file embeds one.
     pub cover: Option<egui::TextureHandle>,
+    /// A dark, muted color derived from the cover, used as the adaptive
+    /// background of the Now Playing screen. `None` when there is no cover.
+    pub bg: Option<egui::Color32>,
+}
+
+/// Computes a dark, muted background color from cover pixels (the average
+/// color scaled down toward black) for the Now Playing screen.
+fn average_bg_color(rgba: &image::RgbaImage) -> egui::Color32 {
+    // Sample every few pixels — averaging all of them is unnecessary and a
+    // visible cost when loading a large library.
+    let (mut r, mut g, mut b, mut count) = (0u64, 0u64, 0u64, 0u64);
+    for px in rgba.pixels().step_by(7) {
+        r += px[0] as u64;
+        g += px[1] as u64;
+        b += px[2] as u64;
+        count += 1;
+    }
+    if count == 0 {
+        return egui::Color32::from_rgb(73, 73, 30);
+    }
+    // Darken so the background stays readable behind white lyrics text.
+    let darken = 0.40;
+    let scale = |sum: u64| ((sum / count) as f32 * darken) as u8;
+    egui::Color32::from_rgb(scale(r), scale(g), scale(b))
 }
 
 /// Normalizes text to Unicode NFC (canonical composition).
@@ -44,6 +68,7 @@ pub fn read_track_meta(ctx: &egui::Context, path: &str) -> TrackMeta {
     let mut title = fallback_title;
     let mut artist: Option<String> = None;
     let mut cover: Option<egui::TextureHandle> = None;
+    let mut bg: Option<egui::Color32> = None;
 
     if let Ok(tag) = id3::Tag::read_from_path(path) {
         if let Some(t) = tag.title() {
@@ -57,13 +82,21 @@ pub fn read_track_meta(ctx: &egui::Context, path: &str) -> TrackMeta {
             }
         }
 
-        // Use the first embedded picture as the cover, scaled to 300x300 and
+        // Use the first embedded picture as the cover, scaled to 256x256 and
         // uploaded as a texture. Decode failures leave `cover` as `None`.
+        //
+        // 256px is enough for the largest place a cover is shown (the 240px
+        // playlist header) while using ~30% less VRAM than 300px. `Triangle`
+        // (bilinear) resizing is several times cheaper than `Lanczos3` and
+        // visually indistinguishable at these sizes — this is the main cost of
+        // loading a large library, so it matters most on weak machines.
         if let Some(pic) = tag.pictures().next() {
             if let Ok(img) = image::load_from_memory(&pic.data) {
-                let img = img.resize_to_fill(300, 300, image::imageops::FilterType::Lanczos3);
+                let img = img.resize_to_fill(256, 256, image::imageops::FilterType::Triangle);
                 let rgba = img.to_rgba8();
                 let (w, h) = rgba.dimensions();
+                // Adaptive Now Playing background, derived from the pixels.
+                bg = Some(average_bg_color(&rgba));
                 let color =
                     egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
                 cover = Some(ctx.load_texture(
@@ -79,7 +112,7 @@ pub fn read_track_meta(ctx: &egui::Context, path: &str) -> TrackMeta {
     let title = nfc(&title);
     let artist = artist.map(|a| nfc(&a));
 
-    TrackMeta { title, artist, cover }
+    TrackMeta { title, artist, cover, bg }
 }
 
 /// Messages sent from background loader threads to the UI thread.

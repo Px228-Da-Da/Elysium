@@ -21,3 +21,13 @@ serde_json = "1"
 dirs = "5"
 ureq = "2"
 zip = "2"
+
+# Optimized release build (use `cargo run --release` / `cargo build --release`).
+# These settings trade longer compile times for a faster, smaller binary, which
+# is what matters on low-end machines. Unwinding is kept (no panic="abort") so a
+# failed background task cannot take down the whole process.
+[profile.release]
+opt-level = 3       # full optimization
+lto = true          # link-time optimization across crates (better inlining)
+codegen-units = 1   # one unit = more optimization opportunity
+strip = true        # drop debug symbols → smaller executable

@@ -15,6 +15,17 @@ impl App {
     pub(in crate::app) fn ui_central(&mut self, ctx: &egui::Context) {
         let s = strings(self.language);
 
+        // The Now Playing view replaces the whole central panel (its own
+        // adaptive background, no search row).
+        if self.show_now_playing {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none().fill(BG_MAIN))
+                .show(ctx, |ui| {
+                    self.ui_now_playing(ui);
+                });
+            return;
+        }
+
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(BG_MAIN).inner_margin(24.0))
             .show(ctx, |ui| {
