@@ -1,6 +1,6 @@
 [package]
 name = "Elysium"
-version = "1.0.3"
+version = "1.2.1"
 edition = "2021"
 description = "A lightweight desktop music player in Rust (egui/eframe) with playlists, synced lyrics and global media hotkeys."
 license = "MIT"
