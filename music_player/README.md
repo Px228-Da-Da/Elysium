@@ -26,8 +26,13 @@ finds time-synced ("karaoke") lyrics — from the file's own tags or online.
   lrclib and NetEase, with an in-memory cache.
 - ⌨️ **Global media hotkeys** — play/pause, next, previous, volume and like work
   even when the window is unfocused (e.g. while gaming).
-- 🌍 **Localization** — Russian and Ukrainian, switchable at runtime.
+- 🔎 **Online search ("ЮБ" tab)** — search YouTube Music for tracks and play their
+  audio, fetched on demand with [`yt-dlp`] (and transcoded with `ffmpeg`). See the
+  [Disclaimer](#disclaimer) below.
+- 🌍 **Localization** — Russian, Ukrainian and English, switchable at runtime.
 - ⬆️ **Self-update** — checks GitHub for a newer release and can update in place.
+
+[`yt-dlp`]: https://github.com/yt-dlp/yt-dlp
 
 ---
 
@@ -44,6 +49,17 @@ By default the app scans the folder **`../DownloadedMusic`** (i.e. a
 `DownloadedMusic` folder sitting *next to* the `music_player` directory, not
 inside it). Newly created playlists also get a folder there. To change the
 location, edit `MUSIC_ROOT` in [`src/app/mod.rs`](src/app/mod.rs).
+
+### Runtime dependencies (online search)
+
+The local library, playback and lyrics work out of the box. The optional **"ЮБ"**
+search tab additionally uses two external command-line tools, `yt-dlp` and
+`ffmpeg`. If they are not found on `PATH`, the app downloads them into its data
+folder (`%APPDATA%/Elysium/tools`) on first use. The downloads are Windows builds;
+on other platforms install `yt-dlp` and `ffmpeg` yourself.
+
+This tab makes network requests to YouTube; the rest of the app only goes online
+for lyrics and the update check.
 
 ### Where data is stored
 
@@ -126,3 +142,16 @@ wins).
   label. Do not rename it without a config migration.
 - Global hotkeys use `rdev::grab`, which on some platforms needs accessibility
   permissions to capture keys system-wide.
+
+---
+
+## Disclaimer
+
+Elysium is a personal hobby project, provided **as-is** for personal and
+educational use. The optional "ЮБ" tab retrieves audio through the third-party
+tool [`yt-dlp`]; this project is not affiliated with, endorsed by, or sponsored
+by YouTube or Google. You are solely responsible for using it in accordance with
+the terms of service of any platform you access and with the copyright laws of
+your jurisdiction. The authors accept no liability for misuse.
+
+If you are a rights holder and have a concern, please open an issue.

@@ -207,7 +207,7 @@ pub fn strings(lang: Lang) -> Strings {
             yt_search_btn: "Найти",
             yt_searching: "Поиск…",
             yt_no_results: "Ничего не найдено",
-            yt_empty: "Введите запрос, чтобы найти музыку на YouTube — без рекламы.",
+            yt_empty: "Введите запрос, чтобы найти музыку на YouTube.",
             yt_loading: "Загрузка…",
         },
         Lang::Uk => Strings {
@@ -265,7 +265,7 @@ pub fn strings(lang: Lang) -> Strings {
             yt_search_btn: "Знайти",
             yt_searching: "Пошук…",
             yt_no_results: "Нічого не знайдено",
-            yt_empty: "Введіть запит, щоб знайти музику на YouTube — без реклами.",
+            yt_empty: "Введіть запит, щоб знайти музику на YouTube.",
             yt_loading: "Завантаження…",
         },
         Lang::En => Strings {
@@ -323,7 +323,7 @@ pub fn strings(lang: Lang) -> Strings {
             yt_search_btn: "Search",
             yt_searching: "Searching…",
             yt_no_results: "Nothing found",
-            yt_empty: "Type a query to find music on YouTube — ad-free.",
+            yt_empty: "Type a query to find music on YouTube.",
             yt_loading: "Loading…",
         },
     }
