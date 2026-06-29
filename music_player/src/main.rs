@@ -4,9 +4,10 @@
 //! native window, and hands control to [`app::App`]. All real behavior lives in
 //! the modules below. See `AGENTS.md` for an architecture overview.
 
-// Use the Windows GUI subsystem so launching the .exe does not open a console
-// window. Has no effect on other platforms.
-// #![windows_subsystem = "windows"]
+// Use the Windows GUI subsystem in release builds so launching the .exe does not
+// open a console window. Debug builds keep the console so `println!` diagnostics
+// are visible while developing. Has no effect on other platforms.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
 mod audio;

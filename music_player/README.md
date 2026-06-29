@@ -155,3 +155,12 @@ the terms of service of any platform you access and with the copyright laws of
 your jurisdiction. The authors accept no liability for misuse.
 
 If you are a rights holder and have a concern, please open an issue.
+
+---
+
+## Licenses
+
+Elysium's own source code is released under the **MIT License** (see
+[`LICENSE`](../LICENSE)). The bundled Noto fonts in
+[`src/fonts/`](src/fonts/) are licensed separately under the **SIL Open Font
+License 1.1** (see [`src/fonts/OFL.txt`](src/fonts/OFL.txt)).
