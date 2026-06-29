@@ -1,0 +1,45 @@
+[package]
+name = "Elysium"
+version = "1.0.3"
+edition = "2021"
+description = "A lightweight desktop music player in Rust (egui/eframe) with playlists, synced lyrics and global media hotkeys."
+license = "MIT"
+repository = "https://github.com/Px228-Da-Da/Elysium"
+readme = "README.md"
+
+[dependencies]
+eframe = "0.29"
+egui = "0.29"
+rodio = "0.20"
+walkdir = "2"
+mp3-duration = "0.1.10"
+id3 = "1.17.0"
+image = "0.25.10"
+rdev = { version = "0.5", features = ["unstable_grab"] }
+self_update = "0.42"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+unicode-normalization = "0.1"
+serde_json = "1"
+dirs = "5"
+ureq = "2"
+zip = "2"
+
+# Optimized release build (use `cargo run --release` / `cargo build --release`).
+# These settings trade longer compile times for a faster, smaller binary, which
+# is what matters on low-end machines. Unwinding is kept (no panic="abort") so a
+# failed background task cannot take down the whole process.
+[profile.release]
+opt-level = 3       # full optimization
+lto = true          # link-time optimization across crates (better inlining)
+codegen-units = 1   # one unit = more optimization opportunity
+strip = true        # drop debug symbols → smaller executable
+
+# Optimize *dependencies* even in dev builds. Audio decoding (rodio/symphonia)
+# is unusably slow when compiled unoptimized — e.g. pre-rendering the Lab's
+# whole-track waveform took ~7 s per track in a plain debug build vs ~0.2 s
+# here. Our own crate stays unoptimized, so incremental rebuilds during
+# development are still fast; only third-party crates pay the one-time cost.
+[profile.dev.package."*"]
+opt-level = 3
