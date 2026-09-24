@@ -9,7 +9,7 @@ use crate::app::{App, MUSIC_ROOT};
 use crate::config::{load_deleted_playlists, save_deleted_playlists};
 use crate::lang::{strings, Lang};
 use crate::scanner::Playlist;
-use crate::theme::{ACCENT, TEXT_MUTED};
+use crate::theme::{accent, text, text_muted};
 use eframe::egui;
 use egui::{pos2, vec2, Color32, Rect, RichText, Rounding};
 
@@ -42,11 +42,11 @@ impl App {
                 ui.painter().rect_filled(screen, Rounding::ZERO, Color32::from_black_alpha(170));
 
                 // Card with a subtle accent border.
-                ui.painter().rect_filled(win_rect, Rounding::same(16.0), Color32::from_rgb(28, 28, 28));
+                ui.painter().rect_filled(win_rect, Rounding::same(16.0), crate::theme::surface_2());
                 ui.painter().rect_stroke(
                     win_rect,
                     Rounding::same(16.0),
-                    egui::Stroke::new(1.0, Color32::from_rgb(55, 55, 55)),
+                    egui::Stroke::new(1.0, crate::theme::line()),
                 );
 
                 let mut content = ui.new_child(
@@ -57,9 +57,10 @@ impl App {
 
                 // Header: accent download glyph + title.
                 content.horizontal(|ui| {
-                    ui.label(RichText::new("⬇").size(26.0).color(ACCENT));
+                    let (dl_rect, _) = ui.allocate_exact_size(vec2(26.0, 26.0), egui::Sense::hover());
+                    crate::icons::paint(ui, dl_rect, crate::icons::Icon::Update, accent());
                     ui.add_space(8.0);
-                    ui.label(RichText::new(s.update_title).size(22.0).strong().color(Color32::WHITE));
+                    ui.label(RichText::new(s.update_title).size(22.0).strong().color(text()));
                 });
                 content.add_space(14.0);
 
@@ -67,7 +68,7 @@ impl App {
                 content.label(
                     RichText::new(s.update_available.replace("{v}", &update_info.latest_version))
                         .size(15.0)
-                        .color(TEXT_MUTED),
+                        .color(text_muted()),
                 );
 
                 // Previous attempt's error, if any.
@@ -89,14 +90,14 @@ impl App {
                     content.horizontal(|ui| {
                         ui.spinner();
                         ui.add_space(8.0);
-                        ui.label(RichText::new(s.update_downloading).size(14.0).color(Color32::WHITE));
+                        ui.label(RichText::new(s.update_downloading).size(14.0).color(text()));
                     });
                 } else {
                     content.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Primary action: update now.
                         let update_btn = ui.add(
                             egui::Button::new(RichText::new(s.update_now).size(15.0).strong().color(Color32::BLACK))
-                                .fill(ACCENT)
+                                .fill(accent())
                                 .rounding(20.0)
                                 .min_size(vec2(170.0, 42.0)),
                         );
@@ -108,8 +109,8 @@ impl App {
 
                         // Secondary action: dismiss for this session.
                         let later_btn = ui.add(
-                            egui::Button::new(RichText::new(s.update_later).size(15.0).color(Color32::WHITE))
-                                .fill(Color32::from_rgb(45, 45, 45))
+                            egui::Button::new(RichText::new(s.update_later).size(15.0).color(text()))
+                                .fill(crate::theme::line())
                                 .rounding(20.0)
                                 .min_size(vec2(120.0, 42.0)),
                         );
@@ -189,7 +190,7 @@ impl App {
                 }
 
                 // Card.
-                ui.painter().rect_filled(win_rect, Rounding::same(14.0), Color32::from_rgb(28, 28, 28));
+                ui.painter().rect_filled(win_rect, Rounding::same(14.0), crate::theme::surface_2());
 
                 let mut content = ui.new_child(
                     egui::UiBuilder::new()
@@ -197,14 +198,14 @@ impl App {
                         .layout(egui::Layout::top_down(egui::Align::Min)),
                 );
 
-                content.label(RichText::new(s.new_playlist_title).size(20.0).strong().color(Color32::WHITE));
+                content.label(RichText::new(s.new_playlist_title).size(20.0).strong().color(text()));
                 content.add_space(16.0);
 
                 // Input field with its own rounded background + frameless TextEdit.
                 let field_h = 44.0;
                 let (field_rect, _) =
                     content.allocate_exact_size(vec2(content.available_width(), field_h), egui::Sense::hover());
-                content.painter().rect_filled(field_rect, Rounding::same(10.0), Color32::from_rgb(20, 20, 20));
+                content.painter().rect_filled(field_rect, Rounding::same(10.0), crate::theme::surface());
 
                 let mut field_ui = content.new_child(
                     egui::UiBuilder::new()
@@ -213,7 +214,7 @@ impl App {
                 );
                 let resp = field_ui.add(
                     egui::TextEdit::singleline(&mut self.new_playlist_name)
-                        .hint_text(RichText::new(s.new_playlist_hint).color(TEXT_MUTED))
+                        .hint_text(RichText::new(s.new_playlist_hint).color(text_muted()))
                         .frame(false)
                         .desired_width(f32::INFINITY),
                 );
@@ -229,7 +230,7 @@ impl App {
                         pos2(field_rect.left() + 6.0, field_rect.bottom() - 3.0),
                         pos2(field_rect.right() - 6.0, field_rect.bottom() - 1.0),
                     );
-                    content.painter().rect_filled(underline, Rounding::same(2.0), ACCENT);
+                    content.painter().rect_filled(underline, Rounding::same(2.0), accent());
                 }
 
                 let enter_pressed = resp.lost_focus() && content.input(|i| i.key_pressed(egui::Key::Enter));
@@ -241,7 +242,7 @@ impl App {
                     if ui
                         .add(
                             egui::Button::new(RichText::new(s.create).size(15.0).color(Color32::BLACK))
-                                .fill(ACCENT)
+                                .fill(accent())
                                 .rounding(18.0)
                                 .min_size(vec2(120.0, 36.0)),
                         )
@@ -254,8 +255,8 @@ impl App {
 
                     if ui
                         .add(
-                            egui::Button::new(RichText::new(s.cancel).size(15.0).color(Color32::WHITE))
-                                .fill(Color32::from_rgb(45, 45, 45))
+                            egui::Button::new(RichText::new(s.cancel).size(15.0).color(text()))
+                                .fill(crate::theme::line())
                                 .rounding(18.0)
                                 .min_size(vec2(120.0, 36.0)),
                         )
@@ -319,7 +320,7 @@ impl App {
                     self.rename_playlist_name.clear();
                 }
 
-                ui.painter().rect_filled(win_rect, Rounding::same(14.0), Color32::from_rgb(28, 28, 28));
+                ui.painter().rect_filled(win_rect, Rounding::same(14.0), crate::theme::surface_2());
 
                 let mut content = ui.new_child(
                     egui::UiBuilder::new()
@@ -332,13 +333,13 @@ impl App {
                     Lang::Uk => "Перейменувати плейлист",
                     Lang::En => "Rename playlist",
                 };
-                content.label(RichText::new(title_label).size(20.0).strong().color(Color32::WHITE));
+                content.label(RichText::new(title_label).size(20.0).strong().color(text()));
                 content.add_space(16.0);
 
                 let field_h = 44.0;
                 let (field_rect, _) =
                     content.allocate_exact_size(vec2(content.available_width(), field_h), egui::Sense::hover());
-                content.painter().rect_filled(field_rect, Rounding::same(10.0), Color32::from_rgb(20, 20, 20));
+                content.painter().rect_filled(field_rect, Rounding::same(10.0), crate::theme::surface());
 
                 let mut field_ui = content.new_child(
                     egui::UiBuilder::new()
@@ -352,7 +353,7 @@ impl App {
                 };
                 let resp = field_ui.add(
                     egui::TextEdit::singleline(&mut self.rename_playlist_name)
-                        .hint_text(RichText::new(hint).color(Color32::from_rgb(100, 100, 100)))
+                        .hint_text(RichText::new(hint).color(text_muted()))
                         .frame(false)
                         .desired_width(f32::INFINITY),
                 );
@@ -365,7 +366,7 @@ impl App {
                         pos2(field_rect.left() + 6.0, field_rect.bottom() - 3.0),
                         pos2(field_rect.right() - 6.0, field_rect.bottom() - 1.0),
                     );
-                    content.painter().rect_filled(underline, Rounding::same(2.0), ACCENT);
+                    content.painter().rect_filled(underline, Rounding::same(2.0), accent());
                 }
 
                 let enter_pressed = resp.lost_focus() && content.input(|i| i.key_pressed(egui::Key::Enter));
@@ -382,7 +383,7 @@ impl App {
                     if ui
                         .add(
                             egui::Button::new(RichText::new(save_label).size(15.0).color(Color32::BLACK))
-                                .fill(ACCENT)
+                                .fill(accent())
                                 .rounding(18.0)
                                 .min_size(vec2(120.0, 36.0)),
                         )
@@ -400,8 +401,8 @@ impl App {
                     };
                     if ui
                         .add(
-                            egui::Button::new(RichText::new(cancel_label).size(15.0).color(Color32::WHITE))
-                                .fill(Color32::from_rgb(45, 45, 45))
+                            egui::Button::new(RichText::new(cancel_label).size(15.0).color(text()))
+                                .fill(crate::theme::line())
                                 .rounding(18.0)
                                 .min_size(vec2(120.0, 36.0)),
                         )
@@ -427,6 +428,105 @@ impl App {
                 if do_cancel {
                     self.rename_playlist_idx = None;
                     self.rename_playlist_name.clear();
+                }
+            });
+    }
+
+    /// Confirmation dialog shown before a playlist is actually deleted
+    /// (triggered by the header trash button). Deletes only on "Delete".
+    pub(in crate::app) fn ui_confirm_delete_playlist(&mut self, ctx: &egui::Context) {
+        let Some(idx) = self.confirm_delete_playlist else {
+            return;
+        };
+        // Resolve the name now; bail out if the index went stale.
+        let Some(name) = self.playlists.get(idx).map(|p| p.name.clone()) else {
+            self.confirm_delete_playlist = None;
+            return;
+        };
+        let lang = self.language;
+        let screen = ctx.screen_rect();
+        let win_rect = Rect::from_center_size(screen.center(), vec2(420.0, 200.0));
+
+        egui::Area::new(egui::Id::new("confirm_delete_overlay"))
+            .order(egui::Order::Foreground)
+            .interactable(true)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                ui.set_clip_rect(screen);
+                let _ = ui.allocate_rect(screen, egui::Sense::click_and_drag());
+                ui.painter().rect_filled(screen, Rounding::same(0.0), Color32::from_black_alpha(160));
+
+                let mut do_delete = false;
+                let mut do_cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
+
+                ui.painter().rect_filled(win_rect, Rounding::same(14.0), crate::theme::surface_2());
+
+                let mut content = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(win_rect.shrink(22.0))
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+
+                let title = match lang {
+                    Lang::Ru => "Удалить плейлист?",
+                    Lang::Uk => "Видалити плейлист?",
+                    Lang::En => "Delete playlist?",
+                };
+                content.label(RichText::new(title).size(20.0).strong().color(text()));
+                content.add_space(10.0);
+
+                let msg = match lang {
+                    Lang::Ru => format!("«{}» будет удалён безвозвратно.", name),
+                    Lang::Uk => format!("«{}» буде видалено безповоротно.", name),
+                    Lang::En => format!("\u{201C}{}\u{201D} will be permanently deleted.", name),
+                };
+                content.label(RichText::new(msg).size(14.0).color(text_muted()));
+                content.add_space(24.0);
+
+                content.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let del_label = match lang {
+                        Lang::Ru => "Удалить",
+                        Lang::Uk => "Видалити",
+                        Lang::En => "Delete",
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new(del_label).size(15.0).color(Color32::WHITE))
+                                .fill(Color32::from_rgb(220, 70, 70))
+                                .rounding(18.0)
+                                .min_size(vec2(120.0, 36.0)),
+                        )
+                        .clicked()
+                    {
+                        do_delete = true;
+                    }
+
+                    ui.add_space(10.0);
+
+                    let cancel_label = match lang {
+                        Lang::Ru => "Отмена",
+                        Lang::Uk => "Скасувати",
+                        Lang::En => "Cancel",
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new(cancel_label).size(15.0).color(text()))
+                                .fill(crate::theme::line())
+                                .rounding(18.0)
+                                .min_size(vec2(120.0, 36.0)),
+                        )
+                        .clicked()
+                    {
+                        do_cancel = true;
+                    }
+                });
+
+                if do_delete {
+                    self.delete_playlist(idx);
+                    self.confirm_delete_playlist = None;
+                }
+                if do_cancel {
+                    self.confirm_delete_playlist = None;
                 }
             });
     }

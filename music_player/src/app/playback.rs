@@ -11,6 +11,22 @@ use crate::scanner::{self, Playlist};
 use crate::shortcuts::Shortcut;
 use std::time::Duration;
 
+/// Reads a track's total length from the file (used off the UI thread).
+///
+/// MP3: `mp3-duration` scans frames, which stays accurate even for VBR files
+/// that lack a Xing/Info header. Every other format: read the duration from its
+/// headers via `lofty`. Returns `None` if the file can't be read.
+pub(crate) fn track_duration(path: &str) -> Option<Duration> {
+    let is_mp3 = std::path::Path::new(path)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("mp3"));
+    if is_mp3 {
+        mp3_duration::from_path(path).ok()
+    } else {
+        crate::meta::read_raw_meta(path).duration
+    }
+}
+
 impl App {
     /// Plays the next track in the snapshot queue.
     ///
@@ -121,17 +137,18 @@ impl App {
         }
 
         // If the decoder couldn't report a duration (the common case for MP3),
-        // compute it off the UI thread: measuring an MP3's length means scanning
-        // the whole file, which would otherwise freeze the UI on every track
-        // change. The result is picked up in `App::update`. Replacing the
-        // receiver here also discards any in-flight result from a previous track.
+        // read it from the file's headers/tags off the UI thread. Doing this on
+        // the UI thread would freeze it on every track change. The result is
+        // picked up in `App::update`. Replacing the receiver here also discards
+        // any in-flight result from a previous track. `lofty` reports duration
+        // for every supported format, not just MP3.
         self.duration_receiver = None;
         if self.total_duration.is_none() {
             let (dtx, drx) = std::sync::mpsc::channel();
             self.duration_receiver = Some(drx);
             let path_for_duration = path.to_string();
             std::thread::spawn(move || {
-                let _ = dtx.send(mp3_duration::from_path(&path_for_duration).ok());
+                let _ = dtx.send(track_duration(&path_for_duration));
             });
         }
 
@@ -154,10 +171,15 @@ impl App {
                     let _ = tx.send(Some(lyrics));
                     return;
                 }
-                // Otherwise search online by tags + duration. Pass the FULL path
-                // (needed to read ID3 tags), not just the file name.
+                // Otherwise search online by tags + duration. Duration greatly
+                // sharpens matching (it lets us safely fall back to a title-only
+                // search for files with messy artist tags), but rodio reports
+                // `None` for most MP3s — so read it from the file here when the
+                // decoder couldn't. Pass the FULL path (needed to read tags).
+                let duration =
+                    duration_for_thread.or_else(|| track_duration(&path_for_thread));
                 let internet_lyrics =
-                    scanner::fetch_lyrics_from_internet(&path_for_thread, duration_for_thread);
+                    scanner::fetch_lyrics_from_internet(&path_for_thread, duration);
                 let _ = tx.send(internet_lyrics);
             });
         }

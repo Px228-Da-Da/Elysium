@@ -6,7 +6,7 @@
 
 use crate::app::App;
 use crate::lang::strings;
-use crate::theme::{ACCENT, TEXT_MUTED};
+use crate::theme::{accent, text, text_muted};
 use eframe::egui;
 use egui::{pos2, vec2, Color32, FontId, Rect, RichText, Rounding, Vec2};
 
@@ -44,12 +44,14 @@ impl App {
                     .layout(egui::Layout::left_to_right(egui::Align::Center)),
             );
             inner.add_space(8.0);
-            inner.label(RichText::new("🔍").size(14.0).color(TEXT_MUTED));
+            let (yt_icon_rect, _) = inner.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+            crate::icons::paint(&inner, yt_icon_rect, crate::icons::Icon::Search, text_muted());
+            inner.add_space(6.0);
             let response = inner.add(
                 egui::TextEdit::singleline(&mut self.yt_query)
                     .frame(false)
-                    .hint_text(RichText::new(s.yt_search_hint).color(TEXT_MUTED))
-                    .text_color(Color32::WHITE)
+                    .hint_text(RichText::new(s.yt_search_hint).color(text_muted()))
+                    .text_color(text())
                     .desired_width(330.0),
             );
             if response.lost_focus() && inner.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -59,7 +61,7 @@ impl App {
             ui.add_space(10.0);
             let btn = ui.add(
                 egui::Button::new(RichText::new(s.yt_search_btn).size(14.0).color(Color32::WHITE))
-                    .fill(ACCENT)
+                    .fill(accent())
                     .rounding(18.0),
             );
             if btn.clicked() {
@@ -76,9 +78,9 @@ impl App {
         let status = self.yt_status.lock().ok().map(|g| g.clone()).unwrap_or_default();
         if self.yt_searching {
             let line = if status.is_empty() { s.yt_searching.to_string() } else { status };
-            ui.label(RichText::new(line).color(TEXT_MUTED));
+            ui.label(RichText::new(line).color(text_muted()));
         } else if !status.is_empty() {
-            ui.label(RichText::new(status).color(TEXT_MUTED));
+            ui.label(RichText::new(status).color(text_muted()));
         }
         if let Some(err) = &self.yt_error {
             ui.label(RichText::new(err).color(Color32::from_rgb(230, 90, 90)));
@@ -88,7 +90,7 @@ impl App {
         if self.yt_results.is_empty() && !self.yt_searching && self.yt_error.is_none() {
             let msg = if self.yt_searched { s.yt_no_results } else { s.yt_empty };
             ui.add_space(8.0);
-            ui.label(RichText::new(msg).color(TEXT_MUTED));
+            ui.label(RichText::new(msg).color(text_muted()));
             return;
         }
 
@@ -163,32 +165,20 @@ impl App {
             let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
             ui.painter().image(tex.id(), cover_rect, uv, Color32::WHITE);
         } else {
-            ui.painter().text(
-                cover_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "🎵",
-                FontId::proportional(40.0),
-                Color32::from_rgb(90, 90, 90),
-            );
+            crate::icons::paint_at(ui, cover_rect.center(), 40.0, crate::icons::Icon::Music, Color32::from_rgb(90, 90, 90));
         }
 
         // Hover/loading play overlay on the cover.
         if hovered || loading {
             ui.painter()
                 .rect_filled(cover_rect, Rounding::same(6.0), Color32::from_black_alpha(110));
-            let icon = if loading { "⏳" } else { "▶" };
-            ui.painter().text(
-                cover_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                icon,
-                FontId::proportional(34.0),
-                Color32::WHITE,
-            );
+            let icon = if loading { crate::icons::Icon::Hourglass } else { crate::icons::Icon::Play };
+            crate::icons::paint_at(ui, cover_rect.center(), 34.0, icon, Color32::WHITE);
         }
 
         // Title + artist below the cover.
         let text_pos = cover_rect.left_bottom() + Vec2::new(0.0, 12.0);
-        let title_color = if is_active { ACCENT } else { Color32::WHITE };
+        let title_color = if is_active { accent() } else { text() };
         ui.painter().text(
             text_pos,
             egui::Align2::LEFT_TOP,
@@ -202,7 +192,7 @@ impl App {
             egui::Align2::LEFT_TOP,
             clip(sub, 18),
             FontId::proportional(12.0),
-            TEXT_MUTED,
+            text_muted(),
         );
 
         response.clicked() && !loading

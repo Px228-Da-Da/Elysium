@@ -12,8 +12,8 @@
 //! * [`lyrics`]        — floating lyrics window and the drag-and-drop hint.
 //!
 //! Drawing methods recompute the localized [`crate::lang::Strings`] table and
-//! reuse the shared palette in [`crate::theme`] (`ACCENT`, `TEXT_MUTED`,
-//! `BG_MAIN`) so colors stay consistent.
+//! reuse the shared palette in [`crate::theme`] (`accent()`, `text_muted()`,
+//! `bg_main()`) so colors stay consistent.
 
 mod bottom_bar;
 mod central;

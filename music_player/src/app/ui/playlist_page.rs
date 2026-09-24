@@ -8,7 +8,7 @@
 use crate::app::{App, LIKED_PAGE_IDX, LIKED_PLAYLIST_NAME};
 use crate::lang::{strings, Lang};
 use crate::scanner::Playlist;
-use crate::theme::{ACCENT, TEXT_MUTED};
+use crate::theme::{accent, text, text_muted};
 use eframe::egui;
 use egui::{pos2, vec2, Color32, FontId, Rect, RichText, Rounding, Stroke};
 
@@ -38,9 +38,9 @@ impl App {
                 ui.add_space(ui.available_height() / 3.0);
                 ui.label(RichText::new("🤍").size(64.0));
                 ui.add_space(20.0);
-                ui.label(RichText::new(s.liked_music).size(28.0).strong().color(Color32::WHITE));
+                ui.label(RichText::new(s.liked_music).size(28.0).strong().color(text()));
                 ui.add_space(10.0);
-                ui.label(RichText::new(s.liked_empty).size(16.0).color(TEXT_MUTED));
+                ui.label(RichText::new(s.liked_empty).size(16.0).color(text_muted()));
             });
             return;
         }
@@ -58,9 +58,9 @@ impl App {
                     // Cover = first track's cover, or a placeholder.
                     let first_meta = playlist.songs.first().and_then(|s| self.track_meta.get(s));
                     let cover_rect = ui.allocate_exact_size(vec2(240.0, 240.0), egui::Sense::hover()).0;
-                    ui.painter().rect_filled(cover_rect, Rounding::same(8.0), Color32::from_rgb(40, 40, 40));
                     match first_meta.and_then(|m| m.cover.as_ref()) {
                         Some(tex) => {
+                            ui.painter().rect_filled(cover_rect, Rounding::same(8.0), Color32::from_rgb(40, 40, 40));
                             ui.painter().image(
                                 tex.id(),
                                 cover_rect,
@@ -69,13 +69,25 @@ impl App {
                             );
                         }
                         None => {
-                            ui.painter().text(
-                                cover_rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                "🎵",
-                                FontId::proportional(60.0),
-                                Color32::from_rgb(90, 90, 90),
-                            );
+                            // No embedded art: a generated gradient + letters, keyed
+                            // off the first track (or the playlist name).
+                            let seed = playlist.songs.first().map(String::as_str).unwrap_or(playlist.name.as_str());
+                            let (c1, c2) = crate::theme::gen_gradient(seed);
+                            crate::theme::gradient_rrect(ui.painter(), cover_rect, 8.0, c1, c2);
+                            let label_src = first_meta
+                                .map(|m| m.title.as_str())
+                                .filter(|t| !t.trim().is_empty())
+                                .unwrap_or(playlist.name.as_str());
+                            let label = crate::theme::cover_label(label_src);
+                            if !label.is_empty() {
+                                ui.painter().text(
+                                    cover_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    &label,
+                                    FontId::proportional(240.0 * 0.28),
+                                    crate::theme::gen_glyph(seed),
+                                );
+                            }
                         }
                     }
 
@@ -87,12 +99,12 @@ impl App {
                     } else {
                         playlist.name.as_str()
                     };
-                    ui.label(RichText::new(playlist_title).size(24.0).strong().color(Color32::WHITE));
+                    ui.label(RichText::new(playlist_title).size(24.0).strong().color(text()));
                     ui.add_space(4.0);
                     ui.label(
                         RichText::new(s.playlist_tracks.replace("{n}", &playlist.songs.len().to_string()))
                             .size(13.0)
-                            .color(TEXT_MUTED),
+                            .color(text_muted()),
                     );
                     ui.add_space(12.0);
 
@@ -100,20 +112,20 @@ impl App {
                     // delete are hidden for the Liked music page.
                     ui.horizontal(|ui| {
                         if idx != LIKED_PAGE_IDX && playlist.name != LIKED_PLAYLIST_NAME {
-                            let rename_btn = ui
-                                .add(
-                                    egui::Button::new(
-                                        RichText::new("✏").size(16.0).color(Color32::from_rgb(180, 180, 180)),
-                                    )
-                                    .fill(Color32::from_rgb(45, 45, 45))
-                                    .rounding(20.0)
-                                    .min_size(vec2(40.0, 36.0)),
-                                )
-                                .on_hover_text(match self.language {
-                                    Lang::Ru => "Переименовать плейлист",
-                                    Lang::Uk => "Перейменувати плейлист",
-                                    Lang::En => "Rename playlist",
-                                });
+                            let (rn_rect, rename_btn) = ui.allocate_exact_size(vec2(40.0, 36.0), egui::Sense::click());
+                            let rn_hov = rename_btn.hovered();
+                            let rn_fill = if rn_hov { crate::theme::surface_2() } else { crate::theme::surface() };
+                            let rn_stroke = if rn_hov { accent() } else { crate::theme::line() };
+                            ui.painter().rect(rn_rect, Rounding::same(20.0), rn_fill, egui::Stroke::new(1.0, rn_stroke));
+                            crate::icons::paint(ui, rn_rect.shrink(9.0), crate::icons::Icon::Rename, if rn_hov { text() } else { text_muted() });
+                            if rn_hov {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            let rename_btn = rename_btn.on_hover_text(match self.language {
+                                Lang::Ru => "Переименовать плейлист",
+                                Lang::Uk => "Перейменувати плейлист",
+                                Lang::En => "Rename playlist",
+                            });
                             if rename_btn.clicked() {
                                 self.rename_playlist_idx = Some(idx);
                                 self.rename_playlist_name = playlist.name.clone();
@@ -122,35 +134,49 @@ impl App {
                             ui.add_space(8.0);
                         }
 
-                        // ▶ Play the whole playlist.
-                        if ui
-                            .add(
-                                egui::Button::new(RichText::new(s.play).size(15.0).color(Color32::BLACK))
-                                    .fill(ACCENT)
-                                    .rounding(20.0)
-                                    .min_size(vec2(100.0, 36.0)),
-                            )
-                            .clicked()
-                            && !playlist.songs.is_empty()
+                        // Play the whole playlist: accent pill with a play icon + label.
                         {
-                            self.playback_queue = self.get_current_queue();
-                            self.play_track(&playlist.songs[0]);
+                            let (pl_rect, play_resp) = ui.allocate_exact_size(vec2(130.0, 36.0), egui::Sense::click());
+                            let fill = if play_resp.hovered() {
+                                crate::theme::lerp_color(accent(), Color32::WHITE, 0.12)
+                            } else {
+                                accent()
+                            };
+                            ui.painter().rect_filled(pl_rect, Rounding::same(20.0), fill);
+                            let play_label = s.play.trim().trim_start_matches(|c: char| !c.is_alphanumeric()).trim();
+                            let galley = ui.fonts(|f| {
+                                f.layout_no_wrap(play_label.to_string(), FontId::proportional(15.0), Color32::BLACK)
+                            });
+                            let (icon_sz, gap) = (16.0, 8.0);
+                            let start_x = pl_rect.center().x - (icon_sz + gap + galley.rect.width()) / 2.0;
+                            let ic_rect = Rect::from_min_size(pos2(start_x, pl_rect.center().y - icon_sz / 2.0), vec2(icon_sz, icon_sz));
+                            crate::icons::paint(ui, ic_rect, crate::icons::Icon::Play, Color32::BLACK);
+                            ui.painter().galley(pos2(start_x + icon_sz + gap, pl_rect.center().y - galley.rect.height() / 2.0), galley, Color32::BLACK);
+                            if play_resp.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            if play_resp.clicked() && !playlist.songs.is_empty() {
+                                self.playback_queue = self.get_current_queue();
+                                self.play_track(&playlist.songs[0]);
+                            }
                         }
 
                         if idx != LIKED_PAGE_IDX && playlist.name != LIKED_PLAYLIST_NAME {
                             ui.add_space(8.0);
-                            let del = ui
-                                .add(
-                                    egui::Button::new(
-                                        RichText::new("🗑").size(16.0).color(Color32::from_rgb(240, 110, 110)),
-                                    )
-                                    .fill(Color32::from_rgb(45, 45, 45))
-                                    .rounding(20.0)
-                                    .min_size(vec2(40.0, 36.0)),
-                                )
-                                .on_hover_text(s.delete_playlist);
+                            let (del_rect, del) = ui.allocate_exact_size(vec2(40.0, 36.0), egui::Sense::click());
+                            let del_hov = del.hovered();
+                            let del_red = if del_hov { Color32::from_rgb(240, 80, 80) } else { Color32::from_rgb(230, 90, 90) };
+                            let del_fill = if del_hov { crate::theme::surface_2() } else { crate::theme::surface() };
+                            let del_stroke = if del_hov { del_red } else { crate::theme::line() };
+                            ui.painter().rect(del_rect, Rounding::same(20.0), del_fill, egui::Stroke::new(1.0, del_stroke));
+                            crate::icons::paint(ui, del_rect.shrink(9.0), crate::icons::Icon::Delete, del_red);
+                            if del_hov {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            let del = del.on_hover_text(s.delete_playlist);
                             if del.clicked() {
-                                self.delete_playlist(idx);
+                                // Ask for confirmation before actually deleting.
+                                self.confirm_delete_playlist = Some(idx);
                             }
                         }
                     });
@@ -164,7 +190,7 @@ impl App {
                 vec2(ui.available_width(), remaining_height),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
-                    ui.label(RichText::new(s.sort).size(13.0).color(TEXT_MUTED));
+                    ui.label(RichText::new(s.sort).size(13.0).color(text_muted()));
                     ui.add_space(10.0);
 
                     // Filter tracks by the search query (title or artist).
@@ -226,30 +252,54 @@ impl App {
 
         let is_hovered = response.hovered();
         if is_hovered {
-            ui.painter().rect_filled(rect, Rounding::same(6.0), Color32::from_rgb(40, 40, 40));
+            ui.painter().rect_filled(rect, Rounding::same(6.0), crate::theme::surface_2());
         }
 
         // Cover thumbnail with a play/pause overlay on hover or while active.
         let img_size = 40.0;
         let img_pos = rect.min + vec2(8.0, 8.0);
         let img_rect = Rect::from_min_size(img_pos, vec2(img_size, img_size));
-        ui.painter().rect_filled(img_rect, Rounding::same(4.0), Color32::from_rgb(50, 50, 50));
-        if let Some(tex) = meta.and_then(|m| m.cover.as_ref()) {
-            ui.painter().image(
-                tex.id(),
-                img_rect,
-                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                Color32::WHITE,
-            );
+        match meta.and_then(|m| m.cover.as_ref()) {
+            Some(tex) => {
+                ui.painter().rect_filled(img_rect, Rounding::same(4.0), Color32::from_rgb(50, 50, 50));
+                ui.painter().image(
+                    tex.id(),
+                    img_rect,
+                    Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            }
+            None => {
+                // No embedded art: a small generated gradient + letters, matching
+                // the grid and mini-player.
+                let (c1, c2) = crate::theme::gen_gradient(song);
+                crate::theme::gradient_rrect(ui.painter(), img_rect, 4.0, c1, c2);
+                let label_src = meta
+                    .map(|m| m.title.as_str())
+                    .filter(|t| !t.trim().is_empty())
+                    .unwrap_or_else(|| {
+                        std::path::Path::new(song).file_stem().and_then(|s| s.to_str()).unwrap_or("")
+                    });
+                let label = crate::theme::cover_label(label_src);
+                if !label.is_empty() {
+                    ui.painter().text(
+                        img_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        &label,
+                        FontId::proportional(img_size * 0.34),
+                        crate::theme::gen_glyph(song),
+                    );
+                }
+            }
         }
         if is_hovered || (is_active && self.is_playing) {
             ui.painter().rect_filled(img_rect, Rounding::same(4.0), Color32::from_black_alpha(150));
-            let icon = if is_active && self.is_playing { "⏸" } else { "▶" };
-            ui.painter().text(img_rect.center(), egui::Align2::CENTER_CENTER, icon, FontId::proportional(16.0), ACCENT);
+            let icon = if is_active && self.is_playing { crate::icons::Icon::Pause } else { crate::icons::Icon::Play };
+            crate::icons::paint_at(ui, img_rect.center(), 18.0, icon, accent());
         }
 
         // Title + artist, truncated to fit.
-        let text_color = if is_active { ACCENT } else { Color32::WHITE };
+        let text_color = if is_active { accent() } else { text() };
         let title = meta.map(|m| m.title.clone()).unwrap_or_else(|| s.unknown_title.to_string());
         let artist = meta.and_then(|m| m.artist.clone()).unwrap_or_else(|| s.unknown_artist.to_string());
         let max_text_width = rect.width() - img_size - 80.0;
@@ -265,18 +315,17 @@ impl App {
             artist
         };
         ui.painter().text(img_rect.right_top() + vec2(16.0, 4.0), egui::Align2::LEFT_TOP, display_title, FontId::proportional(14.0), text_color);
-        ui.painter().text(img_rect.right_top() + vec2(16.0, 22.0), egui::Align2::LEFT_TOP, display_artist, FontId::proportional(12.0), TEXT_MUTED);
+        ui.painter().text(img_rect.right_top() + vec2(16.0, 22.0), egui::Align2::LEFT_TOP, display_artist, FontId::proportional(12.0), text_muted());
 
         // ❤ Like button.
         let track_liked = self.is_liked(song);
-        let heart_color = if track_liked { ACCENT } else { Color32::from_rgb(120, 120, 120) };
+        let heart_color = if track_liked { accent() } else { Color32::from_rgb(120, 120, 120) };
         let heart_rect = Rect::from_min_size(pos2(rect.right() - 72.0, rect.center().y - 15.0), vec2(30.0, 30.0));
-        let mut child_ui = ui.new_child(egui::UiBuilder::new().max_rect(heart_rect));
-        let heart_click = child_ui.add(
-            egui::Button::new(RichText::new("❤").size(18.0).color(heart_color))
-                .fill(Color32::TRANSPARENT)
-                .frame(false),
-        );
+        let heart_click = ui.interact(heart_rect, ui.id().with(("track_heart", song)), egui::Sense::click());
+        crate::icons::paint(ui, heart_rect.shrink(6.0), crate::icons::Icon::Heart, heart_color);
+        if heart_click.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
         if heart_click.clicked() {
             self.toggle_like(song);
         }
@@ -286,7 +335,7 @@ impl App {
         let dots_rect = Rect::from_min_size(pos2(rect.right() - 36.0, rect.center().y - 15.0), vec2(28.0, 30.0));
         let dots_click = ui.interact(dots_rect, ui.id().with(song), egui::Sense::click());
         let dots_color = if dots_click.hovered() {
-            Color32::WHITE
+            text()
         } else if is_hovered {
             Color32::from_rgb(180, 180, 180)
         } else {
@@ -350,11 +399,11 @@ impl App {
 
         let is_menu_hovered =
             ui.input(|i| i.pointer.hover_pos().map(|p| popup_rect.contains(p)).unwrap_or(false));
-        let bg_color = if is_menu_hovered { Color32::from_rgb(45, 45, 45) } else { Color32::from_rgb(32, 32, 32) };
-        let text_color = if is_menu_hovered { Color32::from_rgb(255, 130, 130) } else { Color32::from_rgb(240, 110, 110) };
+        let bg_color = if is_menu_hovered { crate::theme::surface_2() } else { crate::theme::surface() };
+        let text_color = if is_menu_hovered { Color32::from_rgb(240, 80, 80) } else { Color32::from_rgb(224, 72, 72) };
 
         painter.rect_filled(popup_rect, Rounding::same(8.0), bg_color);
-        painter.rect_stroke(popup_rect, Rounding::same(8.0), Stroke::new(1.0, Color32::from_rgb(70, 70, 70)));
+        painter.rect_stroke(popup_rect, Rounding::same(8.0), Stroke::new(1.0, crate::theme::line()));
         painter.text(pos2(popup_rect.min.x + 14.0, popup_rect.center().y), egui::Align2::LEFT_CENTER, "🗑", FontId::proportional(13.0), text_color);
         painter.text(pos2(popup_rect.min.x + 32.0, popup_rect.center().y), egui::Align2::LEFT_CENTER, remove_label, FontId::proportional(13.0), text_color);
 

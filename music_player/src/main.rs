@@ -12,6 +12,7 @@
 mod app;
 mod audio;
 mod config;
+mod icons;
 mod lab;
 mod lang;
 mod meta;

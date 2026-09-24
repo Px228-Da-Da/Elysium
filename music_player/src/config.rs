@@ -30,6 +30,20 @@ pub struct Config {
     pub language: String,
     /// Maps a shortcut action code to a key name, or `"None"` when unbound.
     pub shortcuts: HashMap<String, String>,
+
+    // --- First-run onboarding ---
+    /// `true` once the user has finished (or skipped) the welcome wizard.
+    pub onboarded: bool,
+    /// Chosen theme: `"dark"` (default) or `"light"`. Saved by the onboarding
+    /// wizard; the light theme is not applied yet.
+    pub theme: String,
+    /// Chosen accent color key: `"purple"`, `"teal"`, `"green"` or `"coral"`.
+    pub accent: String,
+    /// Folders the user picked as music sources during onboarding. When empty,
+    /// the app falls back to the default [`crate::app::MUSIC_ROOT`].
+    pub music_folders: Vec<String>,
+    /// Individual audio files the user dragged in during onboarding.
+    pub music_files: Vec<String>,
 }
 
 /// One playlist as stored on disk: a name plus its ordered track paths.
@@ -48,6 +62,16 @@ pub fn config_path() -> std::path::PathBuf {
     dir.push("Elysium");
     let _ = std::fs::create_dir_all(&dir);
     dir.push("config.json");
+    dir
+}
+
+/// Returns the path to the persistent lyrics cache (`lyrics_cache.json`),
+/// creating the parent directory if needed. Lives next to `config.json`.
+pub fn lyrics_cache_path() -> std::path::PathBuf {
+    let mut dir = dirs::config_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    dir.push("Elysium");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.push("lyrics_cache.json");
     dir
 }
 

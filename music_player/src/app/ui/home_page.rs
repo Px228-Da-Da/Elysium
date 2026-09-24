@@ -6,18 +6,32 @@
 //! track to a playlist.
 
 use crate::app::{App, LIKED_PLAYLIST_NAME};
-use crate::lang::strings;
-use crate::theme::{style_menu, ACCENT, TEXT_MUTED};
+use crate::lang::{strings, Lang};
+use crate::theme::{
+    accent, cover_label, gen_glyph, gen_gradient, gradient_rrect, line, style_menu, surface, surface_2, text, text_muted,
+};
 use eframe::egui;
-use egui::{pos2, vec2, Color32, FontId, Rect, RichText, Rounding, Stroke, Vec2};
+use egui::{pos2, vec2, Align2, Color32, FontId, Rect, RichText, Rounding, Stroke, Vec2};
 use std::collections::HashSet;
 
-/// Card geometry (logical pixels). Kept as constants because the virtualized
-/// grid needs them up front to compute which rows are visible.
-const CARD_W: f32 = 160.0;
-const CARD_H: f32 = 240.0;
-const GAP_X: f32 = 18.0;
-const GAP_Y: f32 = 24.0;
+/// Card geometry (logical pixels). The grid shows between `MIN_COLS` and
+/// `MAX_COLS` cards per row: a wide window fits `MAX_COLS`, and as it shrinks the
+/// column count steps down (never below `MIN_COLS`, after which the cards simply
+/// get smaller). Cards are always stretched to divide the row width exactly, so
+/// there is never an empty gutter on the right. The card height follows the
+/// (square) cover width plus a fixed footer (title + artist + padding).
+const MIN_COLS: usize = 3;
+const MAX_COLS: usize = 5;
+/// Nominal card width used to decide how many columns fit before stepping down.
+/// Kept small so a maximized window reaches `MAX_COLS` even under OS display
+/// scaling (which narrows the logical width).
+const NOMINAL_CARD_W: f32 = 175.0;
+/// Height added below the square cover for the title + artist + bottom padding.
+const CARD_FOOTER: f32 = 54.0;
+const GAP_X: f32 = 24.0;
+const GAP_Y: f32 = 28.0;
+/// Corner radius of a cover, relative to its width.
+const COVER_ROUND: f32 = 0.07;
 
 impl App {
     /// Returns the cached Home track list, rebuilding it only when its inputs
@@ -58,8 +72,15 @@ impl App {
                 .filter(|p| p.name != LIKED_PLAYLIST_NAME)
                 .flat_map(|p| p.songs.iter().cloned())
                 .filter(|song| {
-                    if !seen_songs.insert(song.clone()) {
-                        return false; // already shown via another playlist
+                    // De-duplicate by file name (case-insensitive), so the *same*
+                    // track sitting in several playlists/folders — with different
+                    // paths — is shown only once.
+                    let dedup_key = std::path::Path::new(song)
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_lowercase())
+                        .unwrap_or_else(|| song.to_lowercase());
+                    if !seen_songs.insert(dedup_key) {
+                        return false; // already shown (same file elsewhere)
                     }
                     if query.is_empty() {
                         return true;
@@ -93,9 +114,29 @@ impl App {
     pub(in crate::app) fn ui_home_page(&mut self, ui: &mut egui::Ui) {
         let s = strings(self.language);
 
-        // Fixed heading above the scroll area.
-        ui.label(RichText::new(s.listen_again).size(26.0).strong().color(Color32::WHITE));
-        ui.add_space(20.0);
+        // Small gap below the search bar, then the heading row.
+        ui.add_space(2.0);
+        // Use the current cursor (below the search row), not the panel top.
+        let top = ui.cursor().min;
+        let full_w = ui.available_width();
+        // Single-line heading, as in the mockup.
+        ui.painter().text(
+            pos2(top.x, top.y + 4.0),
+            Align2::LEFT_TOP,
+            s.listen_again,
+            FontId::proportional(34.0),
+            text(),
+        );
+        ui.painter().text(
+            pos2(top.x + full_w, top.y + 16.0),
+            Align2::RIGHT_TOP,
+            all_history(self.language),
+            FontId::proportional(13.0),
+            text_muted(),
+        );
+        // Reserve the single-line heading (~44px tall) plus a small gap before
+        // the card grid.
+        ui.add_space(56.0);
 
         // Refresh (or reuse) the cached list.
         self.home_track_list();
@@ -103,7 +144,6 @@ impl App {
             return;
         }
 
-        let row_h = CARD_H + GAP_Y;
         let mut to_play: Option<String> = None;
 
         egui::ScrollArea::vertical()
@@ -111,9 +151,16 @@ impl App {
             .auto_shrink([false, false])
             .show_viewport(ui, |ui, viewport| {
                 let n = self.home_cache.len();
-                // Columns that fit the actual content width; rows follow.
                 let avail_w = ui.available_width();
-                let cols = (((avail_w + GAP_X) / (CARD_W + GAP_X)).floor() as usize).max(1);
+                // How many nominal-width cards fit, clamped to [MIN_COLS, MAX_COLS]:
+                // 5 on a wide window, stepping down to 3 as it narrows. The cards
+                // are then stretched to divide the row width exactly (no gutter).
+                let fit = ((avail_w + GAP_X) / (NOMINAL_CARD_W + GAP_X)).floor() as usize;
+                let cols = fit.clamp(MIN_COLS, MAX_COLS);
+                let card_w = (avail_w - (cols as f32 - 1.0) * GAP_X) / cols as f32;
+                let card_h = card_w + CARD_FOOTER;
+                let row_h = card_h + GAP_Y;
+
                 let rows = n.div_ceil(cols);
                 let total_h = rows as f32 * row_h;
 
@@ -132,9 +179,9 @@ impl App {
                         if idx >= n {
                             break;
                         }
-                        let x = origin.x + col as f32 * (CARD_W + GAP_X);
+                        let x = origin.x + col as f32 * (card_w + GAP_X);
                         let y = origin.y + row as f32 * row_h;
-                        let rect = Rect::from_min_size(pos2(x, y), vec2(CARD_W, CARD_H));
+                        let rect = Rect::from_min_size(pos2(x, y), vec2(card_w, card_h));
 
                         // Clone just this one (visible) song so the `self` borrow
                         // is free for the &mut call below.
@@ -171,58 +218,54 @@ impl App {
         let response = ui.interact(rect, ui.make_persistent_id(("home_card", song)), egui::Sense::click());
         let is_hovered = response.hovered();
 
-        let bg_color = if is_hovered { Color32::from_rgb(40, 40, 40) } else { Color32::from_rgb(24, 24, 24) };
-        ui.painter().rect_filled(rect, Rounding::same(8.0), bg_color);
+        // Card panel — a subtle bordered rounded surface that lifts on hover.
+        let dy = ui.ctx().animate_bool_with_time(ui.make_persistent_id(("card_lift", song)), is_hovered, 0.13) * 4.0;
+        let rect = rect.translate(vec2(0.0, -dy));
+        let panel_fill = if is_hovered { surface_2() } else { surface() };
+        ui.painter().rect(rect, Rounding::same(14.0), panel_fill, Stroke::new(1.0, line()));
 
-        // Cover.
-        let cover_size = 132.0;
-        let cover_pos = rect.min + Vec2::new(14.0, 14.0);
-        let cover_rect = Rect::from_min_size(cover_pos, Vec2::new(cover_size, cover_size));
-        ui.painter().rect_filled(cover_rect, Rounding::same(6.0), Color32::from_rgb(50, 50, 50));
-        if let Some(tex) = meta.and_then(|m| m.cover.as_ref()) {
-            ui.painter().image(
-                tex.id(),
-                cover_rect,
-                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                Color32::WHITE,
-            );
-        } else {
-            ui.painter().text(cover_rect.center(), egui::Align2::CENTER_CENTER, "🎵", FontId::proportional(40.0), Color32::from_rgb(90, 90, 90));
-        }
+        // Cover: inset within the panel (padding all around), square and rounded.
+        let pad = 12.0;
+        let cover_side = rect.width() - 2.0 * pad;
+        let cover_rect = Rect::from_min_size(rect.min + vec2(pad, pad), vec2(cover_side, cover_side));
+        let title = meta
+            .map(|m| m.title.clone())
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| {
+                std::path::Path::new(song)
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| s.unknown_title.to_string())
+            });
+        draw_cover(ui, cover_rect, song, meta, &title);
 
-        // Title + artist below the cover (truncated to the card width).
-        let text_pos = cover_rect.left_bottom() + Vec2::new(0.0, 12.0);
-        let text_color = if is_active { ACCENT } else { Color32::WHITE };
-        let max_chars_title = 15;
-        let max_chars_artist = 18;
-
-        let title = meta.map(|m| m.title.clone()).unwrap_or_else(|| s.unknown_title.to_string());
-        let display_name = if title.chars().count() > max_chars_title {
-            format!("{}...", title.chars().take(max_chars_title - 3).collect::<String>())
-        } else {
-            title
-        };
-        ui.painter().text(text_pos, egui::Align2::LEFT_TOP, display_name, FontId::proportional(14.0), text_color);
+        // Title + artist below the cover (inside the panel padding). Font sizes
+        // scale with the card width, and each line is truncated to the *measured*
+        // pixel width (leaving room for the heart on the right) so nothing spills
+        // out of the card when the window (and cards) get small.
+        let text_left = rect.left() + pad;
+        let ty = cover_rect.bottom() + 14.0;
+        let text_color = if is_active { accent() } else { text() };
+        let title_font = (rect.width() * 0.068).clamp(11.0, 16.0);
+        let artist_font = (rect.width() * 0.055).clamp(9.0, 13.0);
+        // Width available for text: card minus left pad and the heart's column.
+        let text_w = (rect.width() - pad - 34.0).max(24.0);
+        let title_galley = fit_line(ui, &title, FontId::proportional(title_font), text_color, text_w);
+        ui.painter().galley(pos2(text_left, ty), title_galley, text_color);
 
         let artist = meta.and_then(|m| m.artist.clone()).unwrap_or_else(|| s.unknown_artist.to_string());
-        let subtitle = if artist.chars().count() > max_chars_artist {
-            format!("{}...", artist.chars().take(max_chars_artist - 3).collect::<String>())
-        } else {
-            artist
-        };
-        let subtext_pos = text_pos + Vec2::new(0.0, 18.0);
-        ui.painter().text(subtext_pos, egui::Align2::LEFT_TOP, subtitle, FontId::proportional(12.0), TEXT_MUTED);
+        let artist_galley = fit_line(ui, &artist, FontId::proportional(artist_font), text_muted(), text_w);
+        ui.painter().galley(pos2(text_left, ty + 24.0), artist_galley, text_muted());
 
-        // ❤ Like toggle.
+        // ❤ Like toggle (right of the title/artist).
         let liked = self.is_liked(song);
-        let heart_color = if liked { ACCENT } else { Color32::from_rgb(100, 100, 100) };
-        let heart_rect = Rect::from_min_size(pos2(rect.right() - 36.0, rect.bottom() - 36.0), vec2(28.0, 28.0));
-        let mut heart_ui = ui.new_child(egui::UiBuilder::new().max_rect(heart_rect));
-        let heart_click = heart_ui.add(
-            egui::Button::new(RichText::new("❤").size(16.0).color(heart_color))
-                .fill(Color32::TRANSPARENT)
-                .frame(false),
-        );
+        let heart_color = if liked { accent() } else { Color32::from_rgb(120, 120, 128) };
+        let heart_rect = Rect::from_center_size(pos2(rect.right() - pad - 2.0, ty + 18.0), vec2(28.0, 28.0));
+        let heart_click = ui.interact(heart_rect, ui.make_persistent_id(("home_heart", song)), egui::Sense::click());
+        crate::icons::paint(ui, heart_rect.shrink(6.0), crate::icons::Icon::Heart, heart_color);
+        if heart_click.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
         if heart_click.clicked() {
             self.toggle_like(song);
         }
@@ -230,7 +273,7 @@ impl App {
         // ⋮ Three vertical dots in the cover's top-right corner. The clickable
         // zone is invisible (no background/border) so it does not look like a
         // button; the dots are painted manually to avoid missing-glyph boxes.
-        let dots_rect = Rect::from_min_size(pos2(rect.right() - 34.0, rect.min.y + 10.0), vec2(28.0, 28.0));
+        let dots_rect = Rect::from_min_size(pos2(cover_rect.right() - 30.0, cover_rect.top() + 8.0), vec2(28.0, 28.0));
         let dots_id = ui.make_persistent_id(("dots_btn", song));
         let dots_resp = ui.interact(dots_rect, dots_id, egui::Sense::click());
 
@@ -278,9 +321,9 @@ impl App {
             let btn_radius = 22.0;
             let btn_center = cover_rect.max - Vec2::new(btn_radius + 4.0, btn_radius + 4.0);
             ui.painter().circle_filled(btn_center + Vec2::new(0.0, 2.0), btn_radius, Color32::from_black_alpha(100));
-            ui.painter().circle_filled(btn_center, btn_radius, ACCENT);
-            let icon = if is_active && self.is_playing { "⏸" } else { "▶" };
-            ui.painter().text(btn_center, egui::Align2::CENTER_CENTER, icon, FontId::proportional(20.0), Color32::BLACK);
+            ui.painter().circle_filled(btn_center, btn_radius, accent());
+            let icon = if is_active && self.is_playing { crate::icons::Icon::Pause } else { crate::icons::Icon::Play };
+            crate::icons::paint_at(ui, btn_center, 22.0, icon, Color32::BLACK);
         }
 
         // Card click plays the track, but only if no control/menu was clicked.
@@ -324,7 +367,7 @@ impl App {
             }
             let p_name = self.playlists[p_idx].name.clone();
             let already_in = self.playlists[p_idx].songs.iter().any(|s| s == song);
-            let text_color = if already_in { ACCENT } else { Color32::WHITE };
+            let text_color = if already_in { accent() } else { text() };
 
             let btn = ui.add(
                 egui::Button::new(
@@ -341,7 +384,7 @@ impl App {
                 let r = btn.rect;
                 let cx = r.left() + 15.0;
                 let cy = r.center().y;
-                let stroke = Stroke::new(2.0, ACCENT);
+                let stroke = Stroke::new(2.0, accent());
                 ui.painter().line_segment([pos2(cx - 5.0, cy + 1.0), pos2(cx - 1.0, cy + 5.0)], stroke);
                 ui.painter().line_segment([pos2(cx - 1.0, cy + 5.0), pos2(cx + 6.0, cy - 5.0)], stroke);
             }
@@ -359,5 +402,76 @@ impl App {
                 }
             }
         }
+    }
+}
+
+/// Draws a track cover into `rect`. When the file embeds album art, the real
+/// cover image is shown (rounded to the card shape); otherwise a generated
+/// gradient with the title's leading characters is drawn as a fallback.
+fn draw_cover(ui: &mut egui::Ui, rect: Rect, song: &str, meta: Option<&crate::meta::TrackMeta>, title: &str) {
+    let round = rect.width() * COVER_ROUND;
+
+    // Real embedded cover art, if the loader has decoded one for this track.
+    if let Some(tex) = meta.and_then(|m| m.cover.as_ref()) {
+        egui::Image::new((tex.id(), rect.size()))
+            .rounding(Rounding::same(round))
+            .paint_at(ui, rect);
+        return;
+    }
+
+    // Fallback: a generated gradient with the title's leading glyph.
+    let (c1, c2) = gen_gradient(song);
+    gradient_rrect(ui.painter(), rect, round, c1, c2);
+    let label = cover_label(title);
+    if !label.is_empty() {
+        // Bright colored glyph (a light tint of the cover's hue), like the mockup.
+        ui.painter().text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            &label,
+            FontId::proportional(rect.width() * 0.33),
+            gen_glyph(song),
+        );
+    }
+}
+
+/// Lays out `text` on a single line in `font`/`color`, truncated with an
+/// ellipsis to fit within `max_w` pixels (measuring the *actual* glyph widths,
+/// so wide Cyrillic caps never spill out of the card). Returns a ready-to-paint
+/// galley for `Painter::galley`.
+fn fit_line(
+    ui: &egui::Ui,
+    text: &str,
+    font: FontId,
+    color: Color32,
+    max_w: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let make = |s: String| ui.fonts(|f| f.layout_no_wrap(s, font.clone(), color));
+    let full = make(text.to_string());
+    if full.rect.width() <= max_w {
+        return full;
+    }
+    // Binary-search the longest prefix that still fits once an ellipsis is added.
+    let chars: Vec<char> = text.chars().collect();
+    let (mut lo, mut hi) = (0usize, chars.len());
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        let candidate: String = chars[..mid].iter().collect::<String>() + "…";
+        if make(candidate).rect.width() <= max_w {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let candidate: String = chars[..lo].iter().collect::<String>() + "…";
+    make(candidate)
+}
+
+/// Localized "all history" link shown at the top-right of the Home page.
+fn all_history(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ru => "ВСЯ ИСТОРИЯ  →",
+        Lang::Uk => "УСЯ ІСТОРІЯ  →",
+        Lang::En => "ALL HISTORY  →",
     }
 }

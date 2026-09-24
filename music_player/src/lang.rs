@@ -131,7 +131,9 @@ pub struct Strings {
     pub lab_corr: &'static str,
 
     // --- YouTube ("ЮБ") tab ---
-    /// Short sidebar label for the tab.
+    /// Short sidebar label for the tab. Temporarily unused while the ЮБ sidebar
+    /// entry is commented out — kept so re-enabling it needs no lang changes.
+    #[allow(dead_code)]
     pub yt_tab: &'static str,
     /// Placeholder text in the YouTube search box.
     pub yt_search_hint: &'static str,

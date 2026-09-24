@@ -70,9 +70,10 @@ impl Player {
     /// Loads and starts playing the file at `path`, replacing whatever was
     /// playing. Returns the track's total duration when it can be determined.
     ///
-    /// Duration comes from rodio when available; for MP3s that report `None`,
-    /// we fall back to the `mp3-duration` crate. Returns `None` if the file
-    /// cannot be opened or decoded.
+    /// Duration comes from rodio when available; for formats that report `None`
+    /// (commonly MP3), the caller falls back to reading it from the file's
+    /// headers via `lofty`. Returns `None` if the file cannot be opened or
+    /// decoded.
     pub fn play(&self, path: &str) -> Option<Duration> {
         // Invalidate any in-flight background seek so it does not resurrect the
         // previous track on top of this one.
@@ -98,9 +99,9 @@ impl Player {
         };
 
         // Only use rodio's *instant* duration here. For MP3s it is usually
-        // `None`, and the fallback (scanning the whole file with `mp3-duration`)
-        // is slow — running it here would freeze the UI on every track change.
-        // The caller computes that fallback off-thread; see `App::play_track`.
+        // `None`; the caller reads the fallback from the file's headers
+        // off-thread so the UI never stalls on a track change (see
+        // `App::play_track`).
         let duration = source.total_duration();
 
         println!("📊 Decoded successfully. Duration: {:?}", duration);

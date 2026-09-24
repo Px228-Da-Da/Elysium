@@ -10,10 +10,12 @@
 //!   time-synced ("karaoke") lyrics, first from the file's own ID3 tags, then
 //!   from online providers (lrclib, then NetEase).
 
-use id3::{Tag, TagLike};
+use crate::audio::is_audio_file;
 use reqwest::blocking::Client;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs;
+use std::sync::{Mutex, OnceLock};
 
 /// A named group of track file paths.
 #[derive(Clone)]
@@ -25,12 +27,15 @@ pub struct Playlist {
 /// Scans `root` and builds playlists from its contents.
 ///
 /// Layout rules:
-/// * Each immediate subfolder containing `.mp3` files becomes a playlist named
+/// * Each immediate subfolder containing audio files becomes a playlist named
 ///   after the folder.
-/// * Loose `.mp3` files directly in `root` are grouped into a single
+/// * Loose audio files directly in `root` are grouped into a single
 ///   "Усі треки" (all tracks) playlist.
 ///
-/// Returns an empty vector (after logging) if `root` is missing or has no MP3s.
+/// Every format the player can import is picked up (MP3, FLAC, M4A, OGG, Opus,
+/// WAV, …), not just MP3 — see [`crate::audio::is_audio_file`].
+///
+/// Returns an empty vector (after logging) if `root` is missing or has no audio.
 pub fn scan_music(root: &str) -> Vec<Playlist> {
     let mut playlists = vec![];
 
@@ -55,7 +60,7 @@ pub fn scan_music(root: &str) -> Vec<Playlist> {
             if let Ok(files) = fs::read_dir(&path) {
                 for file in files.flatten() {
                     let file_path = file.path();
-                    if file_path.extension().is_some_and(|ext| ext == "mp3") {
+                    if is_audio_file(&file_path) {
                         songs.push(file_path.to_string_lossy().to_string());
                     }
                 }
@@ -65,8 +70,8 @@ pub fn scan_music(root: &str) -> Vec<Playlist> {
                 println!("📁 Found playlist '{}' ({} songs)", name, songs.len());
                 playlists.push(Playlist { name, songs });
             }
-        } else if path.is_file() && path.extension().is_some_and(|ext| ext == "mp3") {
-            // A loose MP3 in the root folder.
+        } else if path.is_file() && is_audio_file(&path) {
+            // A loose audio file in the root folder.
             root_songs.push(path.to_string_lossy().to_string());
         }
     }
@@ -80,14 +85,26 @@ pub fn scan_music(root: &str) -> Vec<Playlist> {
     }
 
     if playlists.is_empty() {
-        println!("⚠️ WARNING: no MP3 files found at the given path.");
+        println!("⚠️ WARNING: no audio files found at the given path.");
     }
 
     playlists
 }
 
+/// Scans several root folders and concatenates their playlists.
+///
+/// Used when the user picked one or more music sources during onboarding. Each
+/// root is scanned with [`scan_music`]; the results are merged in order.
+pub fn scan_music_paths(roots: &[String]) -> Vec<Playlist> {
+    let mut out = Vec::new();
+    for root in roots {
+        out.extend(scan_music(root));
+    }
+    out
+}
+
 /// One timestamped line of lyrics.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LyricLine {
     /// When this line appears, in milliseconds from the start of the track.
     pub time_ms: u32,
@@ -142,27 +159,40 @@ pub fn get_synced_lyrics(file_path: &str) -> Option<Vec<LyricLine>> {
 /// Subset of the lrclib API response we care about.
 #[derive(Deserialize)]
 struct LrcResponse {
+    #[serde(rename = "trackName")]
+    track_name: Option<String>,
+    #[serde(rename = "artistName")]
+    artist_name: Option<String>,
     duration: Option<f64>,
     #[serde(rename = "syncedLyrics")]
     synced_lyrics: Option<String>,
+    /// Plain, un-timed lyrics — used as a fallback when no synced version
+    /// exists for a track (many songs only have these).
+    #[serde(rename = "plainLyrics")]
+    plain_lyrics: Option<String>,
 }
 
-/// Reads `(title, artist, album)` from a file's ID3 tags, with sensible
-/// fallbacks for messy downloaded files.
+/// Returns `true` if these lines carry real timestamps (a "karaoke" track).
 ///
-/// If the title is empty, the file stem is used. A common pattern in downloaded
-/// music is a title of the form `"Artist - Track"` with a junk artist tag; when
-/// detected, the title is split so the real artist and track are recovered.
-fn read_track_meta(file_path: &str) -> (String, String, String) {
-    let mut title = String::new();
-    let mut artist = String::new();
-    let mut album = String::new();
+/// Un-timed (plain) lyrics are represented as [`LyricLine`]s that all sit at
+/// `time_ms == 0`; a synced track always has at least one later line, so any
+/// non-zero timestamp means the lyrics are synced.
+pub fn is_synced(lines: &[LyricLine]) -> bool {
+    lines.iter().any(|l| l.time_ms != 0)
+}
 
-    if let Ok(tag) = Tag::read_from_path(file_path) {
-        title = tag.title().unwrap_or("").trim().to_string();
-        artist = tag.artist().unwrap_or("").trim().to_string();
-        album = tag.album().unwrap_or("").trim().to_string();
-    }
+/// Reads `(title, artist, album)` from a file's tags, with sensible fallbacks
+/// for messy downloaded files.
+///
+/// Works for every supported format (not just MP3) via `lofty`. If the title is
+/// empty, the file stem is used. A common pattern in downloaded music is a title
+/// of the form `"Artist - Track"` with a junk artist tag; when detected, the
+/// title is split so the real artist and track are recovered.
+fn read_track_meta(file_path: &str) -> (String, String, String) {
+    let raw = crate::meta::read_raw_meta(file_path);
+    let mut title = raw.title.unwrap_or_default();
+    let mut artist = raw.artist.unwrap_or_default();
+    let album = raw.album.unwrap_or_default();
 
     // No title tag: fall back to the file name without extension.
     if title.is_empty() {
@@ -214,46 +244,151 @@ pub fn fetch_lyrics_by_tags(
     }
 
     let dur_secs = duration.map(|d| d.as_secs());
+    let key = cache_key(title, artist, dur_secs);
 
-    // Owned copies to move into the worker threads.
-    let (lrc_title, lrc_artist, lrc_album) =
-        (title.to_string(), artist.to_string(), album.to_string());
+    // 1. Persistent cache: an instant answer for anything looked up before —
+    //    including a remembered "no lyrics" so we don't re-hit the network on
+    //    every replay of a track that has none.
+    if let Some(hit) = cache_lookup(&key) {
+        match &hit {
+            Some(l) => println!("⚡ [cache] {} lyric lines.", l.len()),
+            None => println!("⚡ [cache] Known to have no lyrics."),
+        }
+        return hit;
+    }
+
+    // 2. Query lrclib and NetEase concurrently. lrclib is the primary source
+    //    (huge, accurate, synced); NetEase is a backup. We return the moment
+    //    lrclib yields a *synced* hit — no need to wait for the slower NetEase.
+    let _ = album; // kept in the signature for callers; lrclib ranks locally.
+    let (lrc_title, lrc_artist) = (title.to_string(), artist.to_string());
     let (net_title, net_artist) = (title.to_string(), artist.to_string());
 
-    let lrclib = std::thread::spawn(move || {
-        lrclib_lyrics(&lrc_title, &lrc_artist, &lrc_album, dur_secs)
-    });
+    let lrclib = std::thread::spawn(move || lrclib_lyrics(&lrc_title, &lrc_artist, dur_secs));
     let netease = std::thread::spawn(move || netease_lyrics(&net_title, &net_artist, dur_secs));
 
-    // Prefer lrclib; fall back to the already-running NetEase lookup.
-    if let Some(l) = lrclib.join().ok().flatten() {
-        return Some(l);
-    }
-    if let Some(l) = netease.join().ok().flatten() {
-        return Some(l);
+    let lrc = lrclib.join().ok().flatten();
+    // Fast path: lrclib already has synced lyrics — take them and let the
+    // NetEase thread wind down on its own.
+    if lrc.as_ref().is_some_and(|l| is_synced(l)) {
+        cache_store(&key, &lrc);
+        return lrc;
     }
 
-    println!("❌ No matching lyrics found in any source.");
-    None
+    let net = netease.join().ok().flatten();
+    // Prefer synced from either source, then plain (lrclib preferred).
+    let synced = [lrc.as_ref(), net.as_ref()]
+        .into_iter()
+        .flatten()
+        .find(|l| is_synced(l))
+        .cloned();
+    let result = synced.or(lrc).or(net);
+
+    match &result {
+        Some(l) if is_synced(l) => println!("✅ Synced lyrics found."),
+        Some(_) => println!("ℹ️ Only un-synced (plain) lyrics available."),
+        None => println!("❌ No matching lyrics found in any source."),
+    }
+    cache_store(&key, &result);
+    result
 }
 
-/// Runs a blocking request, retrying a couple of times on transient failures
-/// (timeouts, dropped connections). Online lyrics providers are flaky enough
-/// that a single attempt makes lookups non-deterministic — the same track would
-/// resolve on one play and silently fail on the next.
+// ---------------------------------------------------------------------------
+// Persistent lyrics cache
+//
+// Every resolved lookup — including a "no lyrics" result — is remembered on disk
+// (`lyrics_cache.json`), so replaying a track never re-hits the network. This is
+// the biggest win for perceived speed: the slowest lookups are exactly the
+// tracks with no lyrics (every provider is tried in full), and now they cost one
+// file read on the second play. Negative results expire after `NEG_TTL_SECS` so
+// a song that later gains lyrics is eventually retried.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct LyricCacheEntry {
+    found: bool,
+    #[serde(default)]
+    lines: Vec<LyricLine>,
+    ts: u64,
+}
+
+/// How long a "no lyrics found" result stays cached (30 days).
+const NEG_TTL_SECS: u64 = 60 * 60 * 24 * 30;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Cache key: normalized title + artist + duration, so different-length edits of
+/// a song don't collide and messy tag casing/spacing still hits.
+fn cache_key(title: &str, artist: &str, dur_secs: Option<u64>) -> String {
+    format!(
+        "{}|{}|{}",
+        normalize(title),
+        normalize(artist),
+        dur_secs.map(|d| d.to_string()).unwrap_or_default()
+    )
+}
+
+fn cache_map() -> &'static Mutex<HashMap<String, LyricCacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, LyricCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let map = std::fs::read_to_string(crate::config::lyrics_cache_path())
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        Mutex::new(map)
+    })
+}
+
+/// `Some(Some(lines))` = remembered hit; `Some(None)` = remembered miss still
+/// within its TTL; `None` = nothing usable, the caller should fetch.
+fn cache_lookup(key: &str) -> Option<Option<Vec<LyricLine>>> {
+    let map = cache_map().lock().ok()?;
+    let e = map.get(key)?;
+    if e.found {
+        Some(Some(e.lines.clone()))
+    } else if now_secs().saturating_sub(e.ts) < NEG_TTL_SECS {
+        Some(None)
+    } else {
+        None
+    }
+}
+
+fn cache_store(key: &str, result: &Option<Vec<LyricLine>>) {
+    if let Ok(mut map) = cache_map().lock() {
+        map.insert(
+            key.to_string(),
+            LyricCacheEntry {
+                found: result.is_some(),
+                lines: result.clone().unwrap_or_default(),
+                ts: now_secs(),
+            },
+        );
+        if let Ok(text) = serde_json::to_string(&*map) {
+            let _ = std::fs::write(crate::config::lyrics_cache_path(), text);
+        }
+    }
+}
+
+/// Runs a blocking request, retrying once on a transient failure (timeout,
+/// dropped connection). Kept deliberately short — a single retry recovers from
+/// a flaky moment without turning a dead provider into a multi-second stall.
 fn send_with_retry<F>(mut make_request: F) -> reqwest::Result<reqwest::blocking::Response>
 where
     F: FnMut() -> reqwest::Result<reqwest::blocking::Response>,
 {
-    const ATTEMPTS: u32 = 3;
+    const ATTEMPTS: u32 = 2;
     let mut last_err = None;
     for attempt in 1..=ATTEMPTS {
         match make_request() {
             Ok(resp) => return Ok(resp),
             Err(e) => {
                 if attempt < ATTEMPTS {
-                    println!("🔁 Request failed (attempt {}/{}): {} — retrying…", attempt, ATTEMPTS, e);
-                    std::thread::sleep(std::time::Duration::from_millis(400 * attempt as u64));
+                    std::thread::sleep(std::time::Duration::from_millis(200));
                 }
                 last_err = Some(e);
             }
@@ -262,120 +397,162 @@ where
     Err(last_err.expect("at least one attempt always runs"))
 }
 
-/// Provider #1: lrclib.net — accurate, well-synced lyrics.
+/// Builds an HTTP client with tight timeouts so a slow provider fails fast
+/// instead of freezing the lyrics lookup.
+fn http_client(user_agent: &str) -> Option<Client> {
+    Client::builder()
+        .user_agent(user_agent.to_string())
+        .connect_timeout(std::time::Duration::from_secs(4))
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .ok()
+}
+
+/// Provider #1: lrclib.net — huge, accurate, synced-lyrics database.
 ///
-/// Tries an exact `/api/get` lookup first (which honors duration within ±2s),
-/// then falls back to `/api/search` and picks the best result by duration.
-fn lrclib_lyrics(
+/// Two-step, tuned for speed *and* coverage:
+/// 1. A **narrow** `track_name + artist_name` search — a small, fast response
+///    that resolves cleanly-tagged (usually mainstream) tracks immediately.
+/// 2. If that finds no synced match, a **broad** title-only search — needed for
+///    messy/multi-artist tags ("UMBRELLA, VAMPXL") that don't match lrclib's
+///    artist field. Both are ranked locally by duration + artist similarity.
+///
+/// Prefers a synced version; falls back to plain (un-timed) lyrics.
+fn lrclib_lyrics(title: &str, artist: &str, dur_secs: Option<u64>) -> Option<Vec<LyricLine>> {
+    println!("🌐 [lrclib] Searching: artist='{}', track='{}'", artist, title);
+    let client = http_client("Elysium/1.2.1")?;
+
+    // Step 1: narrow search. Return only on a synced hit — otherwise fall through
+    // so the broad search can find a synced version the artist filter hid.
+    if !artist.is_empty() {
+        let narrow = lrclib_search(&client, title, Some(artist));
+        if let Some(l) = lrclib_pick(&narrow, title, artist, dur_secs, true) {
+            println!("✅ [lrclib] Synced match (narrow).");
+            return Some(l);
+        }
+    }
+
+    // Step 2: broad title-only search; accept synced or plain.
+    let broad = lrclib_search(&client, title, None);
+    match lrclib_pick(&broad, title, artist, dur_secs, false) {
+        Some(l) if is_synced(&l) => {
+            println!("✅ [lrclib] Synced match (broad).");
+            Some(l)
+        }
+        Some(l) => {
+            println!("ℹ️ [lrclib] Only plain (un-synced) lyrics.");
+            Some(l)
+        }
+        None => {
+            println!("❌ [lrclib] Not found.");
+            None
+        }
+    }
+}
+
+/// Ranks search `results` for our track and returns the best lyrics: a synced
+/// match if any (highest duration+artist score wins), otherwise — unless
+/// `synced_only` — the best plain match. Rejects candidates whose title doesn't
+/// match or whose (known) duration is far off, so we never grab a different song.
+fn lrclib_pick(
+    results: &[LrcResponse],
     title: &str,
     artist: &str,
-    album: &str,
     dur_secs: Option<u64>,
+    synced_only: bool,
 ) -> Option<Vec<LyricLine>> {
-    println!("🌐 [lrclib] Searching: artist='{}', track='{}'", artist, title);
-
-    let client = Client::builder()
-        .user_agent("Elysium/1.0.2")
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .timeout(std::time::Duration::from_secs(12))
-        .build()
-        .ok()?;
-
-    // --- Strategy 1: exact match via /api/get (uses duration, ±2s). ---
-    if !artist.is_empty() {
-        if let Some(secs) = dur_secs {
-            let dur_str = secs.to_string();
-            let resp = send_with_retry(|| {
-                client
-                    .get("https://lrclib.net/api/get")
-                    .query(&[
-                        ("track_name", title),
-                        ("artist_name", artist),
-                        ("album_name", album),
-                        ("duration", dur_str.as_str()),
-                    ])
-                    .send()
-            });
-
-            match resp {
-                Ok(r) => {
-                    // 404 here just means "no exact match"; fall through to search.
-                    if r.status().is_success() {
-                        if let Ok(rec) = r.json::<LrcResponse>() {
-                            if let Some(s) = rec.synced_lyrics {
-                                if !s.trim().is_empty() {
-                                    println!("✅ [lrclib] Exact match (api/get).");
-                                    return parse_lrc_string(&s);
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    println!("⚠️ [lrclib] api/get request failed: {} — falling back to search.", e);
-                }
+    let mut best_synced: Option<(i32, &str)> = None;
+    let mut best_plain: Option<(i32, &str)> = None;
+    for r in results {
+        // The title must actually match — the search is fuzzy.
+        if !r.track_name.as_deref().is_some_and(|n| titles_match(n, title)) {
+            continue;
+        }
+        // Duration is the strongest signal; a known-but-far result is a
+        // different song and is rejected outright.
+        let Some(mut score) = duration_score(dur_secs, r.duration) else {
+            continue;
+        };
+        if artist_match(artist, r.artist_name.as_deref()) {
+            score += 50;
+        }
+        if let Some(s) = r.synced_lyrics.as_deref().filter(|s| !s.trim().is_empty()) {
+            if best_synced.map_or(true, |(b, _)| score > b) {
+                best_synced = Some((score, s));
+            }
+        }
+        if let Some(p) = r.plain_lyrics.as_deref().filter(|p| !p.trim().is_empty()) {
+            if best_plain.map_or(true, |(b, _)| score > b) {
+                best_plain = Some((score, p));
             }
         }
     }
 
-    // --- Strategy 2: search by artist + title, choose the closest duration. ---
-    let results: Vec<LrcResponse> = match send_with_retry(|| {
+    if let Some((_, s)) = best_synced {
+        return parse_lrc_string(s);
+    }
+    if synced_only {
+        return None;
+    }
+    best_plain.and_then(|(_, p)| parse_plain_lyrics(p))
+}
+
+/// Runs one lrclib `/api/search` query — by title, optionally narrowed by
+/// `artist` — returning the raw results (an empty vec on any network/parse error
+/// so callers can simply move on).
+fn lrclib_search(client: &Client, title: &str, artist: Option<&str>) -> Vec<LrcResponse> {
+    match send_with_retry(|| {
         let mut req = client
             .get("https://lrclib.net/api/search")
             .query(&[("track_name", title)]);
-        if !artist.is_empty() {
-            req = req.query(&[("artist_name", artist)]);
+        if let Some(a) = artist.filter(|a| !a.is_empty()) {
+            req = req.query(&[("artist_name", a)]);
         }
         req.send()
     }) {
-        Ok(r) => match r.json() {
-            Ok(j) => j,
-            Err(e) => {
-                println!("❌ [lrclib] Could not parse search response: {}", e);
-                return None;
-            }
-        },
+        Ok(r) => r.json::<Vec<LrcResponse>>().unwrap_or_default(),
         Err(e) => {
             println!("❌ [lrclib] Search request failed (network/timeout): {}", e);
-            return None;
-        }
-    };
-
-    let mut best: Option<&LrcResponse> = None;
-    for r in &results {
-        let has_synced = r
-            .synced_lyrics
-            .as_deref()
-            .is_some_and(|s| !s.trim().is_empty());
-        if !has_synced {
-            continue;
-        }
-        match (dur_secs, r.duration) {
-            // Both durations known: accept the first within 3 seconds.
-            (Some(ours), Some(theirs)) => {
-                if (theirs - ours as f64).abs() <= 3.0 {
-                    best = Some(r);
-                    break;
-                }
-            }
-            // Duration unknown on either side: keep the first synced result.
-            _ => {
-                if best.is_none() {
-                    best = Some(r);
-                }
-            }
+            Vec::new()
         }
     }
+}
 
-    if let Some(r) = best {
-        if let Some(s) = &r.synced_lyrics {
-            println!("✅ [lrclib] Found via search.");
-            return parse_lrc_string(s);
+/// Scores a candidate by how well its duration matches ours. Returns `None`
+/// (reject) when both durations are known but differ by more than 12s — that is
+/// a different song. When either duration is unknown, returns a small neutral
+/// score so the result stays eligible but ranks below a real duration match.
+fn duration_score(ours: Option<u64>, theirs: Option<f64>) -> Option<i32> {
+    match (ours, theirs) {
+        (Some(o), Some(t)) => {
+            let diff = (t - o as f64).abs();
+            if diff > 12.0 {
+                None
+            } else {
+                Some(100 - (diff * 8.0) as i32)
+            }
         }
+        _ => Some(10),
     }
+}
 
-    println!("❌ [lrclib] Not found.");
-    None
+/// Loose artist match: `true` if any comma/&/`feat`-separated part of our
+/// artist string overlaps (either way) with the candidate's, after
+/// normalization. Handles multi-artist tags like "UMBRELLA, VAMPXL".
+fn artist_match(ours: &str, theirs: Option<&str>) -> bool {
+    let Some(theirs) = theirs else { return false };
+    let nt = normalize(theirs);
+    if nt.is_empty() {
+        return false;
+    }
+    let whole = normalize(ours);
+    if !whole.is_empty() && (nt.contains(&whole) || whole.contains(&nt)) {
+        return true;
+    }
+    ours.split([',', '&', '/']).any(|part| {
+        let np = normalize(part);
+        !np.is_empty() && (nt.contains(&np) || np.contains(&nt))
+    })
 }
 
 // --- Provider #2: NetEase Cloud Music response types ---
@@ -434,12 +611,7 @@ fn netease_lyrics(title: &str, artist: &str, dur_secs: Option<u64>) -> Option<Ve
     };
     println!("🌐 [NetEase] Searching: {}", query);
 
-    let client = Client::builder()
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36")
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .timeout(std::time::Duration::from_secs(12))
-        .build()
-        .ok()?;
+    let client = http_client("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36")?;
 
     // 1. Search for the track to obtain its id (type=1 means "songs").
     let search: NeteaseSearch = match send_with_retry(|| {
@@ -516,12 +688,18 @@ fn netease_lyrics(title: &str, artist: &str, dur_secs: Option<u64>) -> Option<Ve
 
     let lrc = lyric.lrc?.lyric?;
     if lrc.trim().is_empty() {
-        println!("😔 [NetEase] Track has no synced lyrics.");
+        println!("😔 [NetEase] Track has no lyrics.");
         return None;
     }
 
-    println!("✅ [NetEase] Lyrics found!");
-    parse_lrc_string(&lrc)
+    // Prefer the timestamped ("karaoke") version; if NetEase only returned plain
+    // text (no `[mm:ss]` tags), keep it as un-timed lyrics rather than nothing.
+    if let Some(synced) = parse_lrc_string(&lrc) {
+        println!("✅ [NetEase] Synced lyrics found!");
+        return Some(synced);
+    }
+    println!("ℹ️ [NetEase] Only plain (un-synced) lyrics.");
+    parse_plain_lyrics(&lrc)
 }
 
 /// Parses raw LRC text (lines like `[mm:ss.xx] text`) into timed [`LyricLine`]s.
@@ -549,6 +727,45 @@ fn contains_unrenderable(s: &str) -> bool {
             | 0xFF00..=0xFFEF // Halfwidth/Fullwidth forms
         )
     })
+}
+
+/// Strips leading `[...]` tags from a line (LRC timestamps like `[00:12.34]` or
+/// metadata like `[ar: ...]`), returning the remaining text.
+fn strip_leading_tags(mut s: &str) -> &str {
+    s = s.trim_start();
+    while s.starts_with('[') {
+        match s.find(']') {
+            Some(i) => s = s[i + 1..].trim_start(),
+            None => break,
+        }
+    }
+    s
+}
+
+/// Parses plain, un-timed lyrics into [`LyricLine`]s that all sit at
+/// `time_ms == 0` — the representation the UI treats as "no karaoke sync".
+///
+/// Any leading `[...]` tags are stripped (some plain responses still carry
+/// stray timestamps or credits), and lines our font cannot render are dropped.
+/// Returns `None` if nothing renderable remains.
+pub fn parse_plain_lyrics(content: &str) -> Option<Vec<LyricLine>> {
+    let mut lines = Vec::new();
+    for raw in content.lines() {
+        let text = strip_leading_tags(raw.trim()).trim();
+        if contains_unrenderable(text) {
+            continue;
+        }
+        lines.push(LyricLine {
+            time_ms: 0,
+            text: if text.is_empty() { " ".to_string() } else { text.to_string() },
+        });
+    }
+    // Require at least one line with actual words.
+    if lines.iter().any(|l| !l.text.trim().is_empty()) {
+        Some(lines)
+    } else {
+        None
+    }
 }
 
 pub fn parse_lrc_string(content: &str) -> Option<Vec<LyricLine>> {

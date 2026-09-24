@@ -6,9 +6,9 @@
 
 use crate::app::App;
 use crate::lang::strings;
-use crate::theme::{format_duration, ACCENT, TEXT_MUTED};
+use crate::theme::{accent, cover_label, format_duration, gen_gradient, gradient_rrect, line, surface, text, text_muted};
 use eframe::egui;
-use egui::{pos2, Color32, FontId, Rect, RichText, Vec2};
+use egui::{Color32, FontId, RichText, Rounding, Vec2};
 use std::time::Duration;
 
 /// Truncates `text` to at most `max_chars` characters, appending "…" (as "...")
@@ -32,7 +32,8 @@ impl App {
             .min_height(90.0)
             .frame(
                 egui::Frame::none()
-                    .fill(Color32::from_rgb(0, 0, 0))
+                    .fill(self.bg_tint)
+                    .stroke(egui::Stroke::new(1.0, line()))
                     .inner_margin(16.0),
             )
             .show(ctx, |ui| {
@@ -65,25 +66,34 @@ impl App {
                             let (rect, _) =
                                 ui.allocate_exact_size(egui::vec2(56.0, 56.0), egui::Sense::hover());
 
-                            match meta.and_then(|m| m.cover.as_ref()) {
-                                Some(tex) => {
-                                    ui.painter().image(
-                                        tex.id(),
-                                        rect,
-                                        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                                        Color32::WHITE,
-                                    );
-                                }
-                                None => {
-                                    ui.painter().rect_filled(rect, 4.0, Color32::from_rgb(40, 40, 40));
-                                    ui.painter().text(
-                                        rect.center(),
-                                        egui::Align2::CENTER_CENTER,
-                                        "🎵",
-                                        FontId::proportional(24.0),
-                                        TEXT_MUTED,
-                                    );
-                                }
+                            // Real embedded cover art when available; otherwise a
+                            // gradient mini-cover with the track's initials, to
+                            // match the grid's generated covers.
+                            if let Some(tex) = meta.and_then(|m| m.cover.as_ref()) {
+                                egui::Image::new((tex.id(), rect.size()))
+                                    .rounding(Rounding::same(12.0))
+                                    .paint_at(ui, rect);
+                            } else if !self.current_song.is_empty() {
+                                let title = meta
+                                    .map(|m| m.title.clone())
+                                    .filter(|t| !t.trim().is_empty())
+                                    .unwrap_or_else(|| {
+                                        std::path::Path::new(&self.current_song)
+                                            .file_stem()
+                                            .map(|s| s.to_string_lossy().to_string())
+                                            .unwrap_or_default()
+                                    });
+                                let (c1, c2) = gen_gradient(&self.current_song);
+                                gradient_rrect(ui.painter(), rect, 12.0, c1, c2);
+                                ui.painter().text(
+                                    rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    cover_label(&title),
+                                    FontId::proportional(20.0),
+                                    Color32::from_white_alpha(245),
+                                );
+                            } else {
+                                ui.painter().rect_filled(rect, Rounding::same(12.0), Color32::from_rgb(30, 30, 36));
                             }
 
                             ui.vertical(|ui| {
@@ -107,9 +117,9 @@ impl App {
 
                                 // Never wrap: keep each on exactly one line.
                                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                                ui.label(RichText::new(display_name).size(14.0).strong().color(Color32::WHITE));
+                                ui.label(RichText::new(display_name).size(14.0).strong().color(text()));
                                 if !display_artist.is_empty() {
-                                    ui.label(RichText::new(display_artist).size(12.0).color(TEXT_MUTED));
+                                    ui.label(RichText::new(display_artist).size(12.0).color(text_muted()));
                                 }
                             });
 
@@ -119,14 +129,8 @@ impl App {
                                 ui.add_space(12.0);
                                 let song = self.current_song.clone();
                                 let liked = self.is_liked(&song);
-                                let heart_color = if liked { ACCENT } else { TEXT_MUTED };
-                                let heart = ui
-                                    .add(
-                                        egui::Button::new(RichText::new("❤").size(20.0).color(heart_color))
-                                            .fill(Color32::TRANSPARENT)
-                                            .frame(false)
-                                            .min_size(Vec2::new(34.0, 34.0)),
-                                    )
+                                let heart_color = if liked { accent() } else { text_muted() };
+                                let heart = crate::icons::button(ui, 34.0, crate::icons::Icon::Heart, heart_color)
                                     .on_hover_text(if liked { s.unlike_hint } else { s.like_hint });
                                 if heart.clicked() {
                                     self.toggle_like(&song);
@@ -153,8 +157,8 @@ impl App {
                                 ui.spacing_mut().item_spacing.x = 18.0;
 
                                 let prev_btn = ui.add(
-                                    egui::Button::new(RichText::new("⏮").size(16.0).color(Color32::WHITE))
-                                        .fill(Color32::from_rgb(30, 30, 30))
+                                    egui::Button::new(RichText::new("⏮").size(16.0).color(text()))
+                                        .fill(surface())
                                         .rounding(100.0)
                                         .min_size(Vec2::new(32.0, 32.0)),
                                 );
@@ -162,13 +166,18 @@ impl App {
                                     self.play_previous_track();
                                 }
 
-                                let play_icon = if self.is_playing { "⏸" } else { "▶" };
-                                let play_btn = ui.add(
-                                    egui::Button::new(RichText::new(play_icon).size(18.0).color(Color32::BLACK))
-                                        .fill(Color32::WHITE)
-                                        .rounding(100.0)
-                                        .min_size(Vec2::new(32.0, 32.0)),
-                                );
+                                let (play_rect, play_btn) =
+                                    ui.allocate_exact_size(Vec2::new(36.0, 36.0), egui::Sense::click());
+                                ui.painter().circle_filled(play_rect.center(), 18.0, text());
+                                let play_icon = if self.is_playing {
+                                    crate::icons::Icon::Pause
+                                } else {
+                                    crate::icons::Icon::Play
+                                };
+                                crate::icons::paint(ui, play_rect.shrink(10.0), play_icon, crate::theme::bg_main());
+                                if play_btn.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
                                 if play_btn.clicked() && !self.current_song.is_empty() {
                                     if self.is_playing {
                                         self.player.pause();
@@ -180,8 +189,8 @@ impl App {
                                 }
 
                                 let next_btn = ui.add(
-                                    egui::Button::new(RichText::new("⏭").size(16.0).color(Color32::WHITE))
-                                        .fill(Color32::from_rgb(30, 30, 30))
+                                    egui::Button::new(RichText::new("⏭").size(16.0).color(text()))
+                                        .fill(surface())
                                         .rounding(100.0)
                                         .min_size(Vec2::new(32.0, 32.0)),
                                 );
@@ -196,7 +205,7 @@ impl App {
                                 ui.label(
                                     RichText::new(format_duration(self.elapsed_duration))
                                         .size(11.0)
-                                        .color(TEXT_MUTED),
+                                        .color(text_muted()),
                                 );
 
                                 let total_secs_f32 =
@@ -240,7 +249,7 @@ impl App {
                                             .unwrap_or_else(|| "0:00".to_string()),
                                     )
                                     .size(11.0)
-                                    .color(TEXT_MUTED),
+                                    .color(text_muted()),
                                 );
                             });
                         },
@@ -264,7 +273,9 @@ impl App {
                             {
                                 self.player.set_volume(self.volume);
                             }
-                            ui.label(RichText::new("🔊").size(14.0).color(TEXT_MUTED));
+                            let (spk_rect, _) =
+                                ui.allocate_exact_size(Vec2::new(18.0, 18.0), egui::Sense::hover());
+                            crate::icons::paint(ui, spk_rect, crate::icons::Icon::Speaker, text_muted());
                         },
                     );
                 });
